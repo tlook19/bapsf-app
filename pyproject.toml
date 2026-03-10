@@ -1,0 +1,33 @@
+[project]
+name = "bapsf-app"
+version = "0.1.0"
+description = "Webapp and database management for LAPD plasma transport simulations"
+authors = [
+    {name = "Tom", email = "tlook@physics.ucla.edu"}
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy (>=2.4.2,<3.0.0)",
+    "matplotlib (>=3.10.8,<4.0.0)",
+    "h5py (>=3.0,<4.0)",
+    "streamlit (>=1.30,<2.0)",
+    "psutil (>=5.0,<7.0)",
+    "setproctitle (>=1.3,<2.0)"
+]
+
+[project.scripts]
+lapd-app = "bapsf_app._run_app:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = true
+name = "bapsf-app"
+packages = [{include = "bapsf_app"}]
+
+[tool.poetry.dependencies]
+python = ">=3.14"
+# Local path — swap for a version specifier once cablp is published to PyPI
+cablp = {path = "../bapsf-transport/cablp", develop = true}
