@@ -147,11 +147,14 @@ def _apply_equilibrated_nn(params, flags, nn_eq):
     """
     n_cells = int(params.get("cells", 3))
     patched = dict(params)
-    # nn0 sets the background for all non-overridden cells
+    # Slice to the configured cell count — nn_eq may be padded to max_cells with NaN
+    # when adaptive mesh is enabled, even though equilibration runs with Plasma=False
+    # and the mesh never actually refines.
+    active_nn = nn_eq[:n_cells]
     if n_cells > 2:
-        patched["nn0"] = float(nn_eq[1:-1].mean())
+        patched["nn0"] = float(active_nn[1:-1].mean())
     else:
-        patched["nn0"] = float(nn_eq.mean())
+        patched["nn0"] = float(active_nn.mean())
     # Source_nn0 and Twin_nn0 are left as-is — the user sets them manually
     return patched
 
@@ -343,7 +346,8 @@ def grid_sweep(
                 results = sim.get_results()
                 run_time = time.time() - t0_run
                 stats = compute_window_stats(results, t_window)
-                n_cells = int(params.get("cells", 3))
+                cat = results.get("cells_at_time")
+                n_cells = int(cat.max()) if cat is not None and len(cat) > 0 else int(params.get("cells", 3))
 
                 save_run(db, run_id, params, flags, results, stats)
                 update_index(db, run_id, params, flags, stats, n_cells, status="ok")
@@ -592,7 +596,8 @@ def grid_sweep_parallel(
             try:
                 _, _, _, results, run_time = future.result()
                 stats = compute_window_stats(results, t_window)
-                n_cells = int(params.get("cells", 3))
+                cat = results.get("cells_at_time")
+                n_cells = int(cat.max()) if cat is not None and len(cat) > 0 else int(params.get("cells", 3))
 
                 with open_db(db_path, mode="a") as db:
                     save_run(db, run_id, params, flags, results, stats)

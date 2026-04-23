@@ -533,17 +533,32 @@ def plot_sweep_variance(
 
     ax.set_xlabel(x_param)
     metric_labels = {
-        "var": "variance",
-        "cov": "coeff. of variation (std/mean)",
+        "var": "spatial variance (var of cell time-means)",
+        "cov": "spatial CoV (std/mean across cells)",
+        "tvar": "temporal variance (mean of cell time-variances)",
+        "tcov": "temporal CoV (mean of cell std/mean)",
+        "total_var": "total variance (spatial + temporal)",
         "min": "minimum",
         "max": "maximum",
         "mean": "mean",
     }
+    title_labels = {
+        "var": f"{quantity} spatial uniformity",
+        "cov": f"{quantity} spatial uniformity",
+        "tvar": f"{quantity} temporal stability",
+        "tcov": f"{quantity} temporal stability",
+        "total_var": f"{quantity} total variance",
+        "min": f"{quantity}",
+        "max": f"{quantity}",
+        "mean": f"{quantity}",
+    }
     ax.set_ylabel(
-        f"{quantity} cell-to-cell {metric_labels.get(metric, metric)}"
+        f"{quantity} {metric_labels.get(metric, metric)}"
         f" [{t_label}]"
     )
-    ax.set_title(f"Effect of {x_param} on {quantity} uniformity  [{t_label}]")
+    ax.set_title(
+        f"Effect of {x_param} on {title_labels.get(metric, quantity)}  [{t_label}]"
+    )
     ax.grid(True, alpha=0.3)
 
     if save_dir is not None:

@@ -232,21 +232,42 @@ PARAM_META: dict[str, dict] = {
         "type": "float", "group": "Magnetic Field",
     },
     # ── Discharge (Primary Cathode) ───────────────────────────────────────────
-    "Vd": {
-        "label": "Discharge voltage (Vd)", "unit": "V", "default": 100.0,
-        "type": "float", "group": "Discharge (Primary Cathode)",
-    },
-    "P_in": {
-        "label": "Total Input Power (P_in)", "unit": "MW", "default": 0.5,
+    "V_bank": {
+        "label": "Power supply voltage (V_bank)", "unit": "V", "default": 100.0,
         "type": "float", "group": "Discharge (Primary Cathode)",
     },
     "S_gp": {
         "label": "Gas puff source rate (S_gp)", "unit": "", "default": 500.0,
         "type": "float", "group": "Discharge (Primary Cathode)",
     },
-    "anode_transparency": {
-        "label": "Anode transparency", "unit": "", "default": 1.0,
+    "T_s": {
+        "label": "Cathode surface temperature (T_s)", "unit": "K", "default": 1900.0,
         "type": "float", "group": "Discharge (Primary Cathode)",
+    },
+    # ── Cathode Hardware ──────────────────────────────────────────────────────
+    "phi_wf": {
+        "label": "Work function (phi_wf)", "unit": "eV", "default": 3.0,
+        "type": "float", "group": "Cathode Hardware",
+    },
+    "C_R": {
+        "label": "Richardson constant (C_R)", "unit": "A cm⁻² K⁻²", "default": 29.0,
+        "type": "float", "group": "Cathode Hardware",
+    },
+    "R_comp": {
+        "label": "Compliance resistor (R_comp)", "unit": "Ω", "default": 0.004,
+        "type": "float", "group": "Cathode Hardware",
+    },
+    "eta": {
+        "label": "Anode/cathode area ratio (eta)", "unit": "", "default": 0.358,
+        "type": "float", "group": "Cathode Hardware",
+    },
+    "L_cath": {
+        "label": "Cathode-to-anode distance (L_cath)", "unit": "cm", "default": 50.0,
+        "type": "float", "group": "Cathode Hardware",
+    },
+    "R_cath": {
+        "label": "Cathode radius (R_cath)", "unit": "cm", "default": 18.0,
+        "type": "float", "group": "Cathode Hardware",
     },
     # ── Source / Sinks ────────────────────────────────────────────────────────
     "Source_nn0": {
@@ -265,6 +286,22 @@ PARAM_META: dict[str, dict] = {
     "cells": {
         "label": "Number of cells", "unit": "", "default": 3,
         "type": "int", "group": "Time & Solver",
+    },
+    "max_cells": {
+        "label": "Max cells (adaptive mesh)", "unit": "", "default": 18,
+        "type": "int", "group": "Time & Solver",
+    },
+    "min_cells": {
+        "label": "Min cells (adaptive mesh)", "unit": "", "default": 3,
+        "type": "int", "group": "Time & Solver",
+    },
+    "mfp_refine_threshold": {
+        "label": "MFP refine threshold", "unit": "", "default": 0.5,
+        "type": "float", "group": "Time & Solver",
+    },
+    "mfp_coarsen_threshold": {
+        "label": "MFP coarsen threshold", "unit": "", "default": 2.0,
+        "type": "float", "group": "Time & Solver",
     },
     "end": {
         "label": "End time (end)", "unit": "s", "default": 21e-3,
@@ -313,10 +350,10 @@ PARAM_META: dict[str, dict] = {
     "b_Qen": {"label": "Q_en scale (b_Qen)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
 }
 
-# Twin cathode params rendered separately under Dual Cathode section
+# Twin cathode params rendered separately under Dual Cathode section.
+# Both cathodes share the same device hardware (V_bank, T_s, etc.); only
+# the neutral-side initial conditions differ per cathode.
 TWIN_META: dict[str, dict] = {
-    "Twin_Vd": {"label": "Twin discharge voltage (Twin_Vd)", "unit": "V", "default": 100.0, "type": "float"},
-    "Twin_Id": {"label": "Twin discharge current (Twin_Id)", "unit": "A", "default": 5000.0, "type": "float"},
     "Twin_nn0": {"label": "Twin neutral density (Twin_nn0)", "unit": "cm⁻³", "default": 1.2e13, "type": "float"},
     "Twin_S_gp": {"label": "Twin gas puff rate (Twin_S_gp)", "unit": "", "default": 500.0, "type": "float"},
 }
@@ -335,6 +372,7 @@ FLAG_META: dict[str, dict] = {
     "Velocity": {"label": "Plasma velocity", "default": True, "group": "Simulation"},
     "breakdown_vel": {"label": "Diffusive flux during breakdown", "default": True, "group": "Simulation"},
     "adaptive": {"label": "Adaptive time stepping (RK45)", "default": False, "group": "Simulation"},
+    "adaptive_mesh": {"label": "Adaptive spatial mesh", "default": True, "group": "Simulation"},
 }
 
 PARAM_GROUP_ORDER = [
@@ -342,6 +380,7 @@ PARAM_GROUP_ORDER = [
     "Machine Geometry",
     "Magnetic Field",
     "Discharge (Primary Cathode)",
+    "Cathode Hardware",
     "Source / Sinks",
     "Time & Solver",
     "Transport Scaling",
@@ -570,10 +609,8 @@ def _build_sweep_config():
     (param_ranges, flag_ranges, fixed_params, fixed_flags, param_transforms).
 
     param_transforms is a callable ``(params, flags) -> params`` applied by the
-    sweep engine after building each run's full params dict.  It derives ``Id``
-    from the user-facing ``P_in`` (Total Input Power) and ``Vd``, and — in
-    symmetric twin mode — splits power and neutral sources equally between the
-    two cathodes.
+    sweep engine after building each run's full params dict.  In symmetric twin
+    mode it splits neutral sources (S_gp, Source_nn0) equally between cathodes.
     """
     param_ranges = {}
     fixed_params = {}
@@ -650,28 +687,16 @@ def _build_sweep_config():
             flag_ranges[key] = [True, False]
 
     # Build param_transforms closure.
-    # Derives Id = P_in / Vd, and in symmetric twin mode splits power + sources equally.
+    # In symmetric twin mode, splits gas puff and neutral source equally between cathodes.
+    # Both cathodes share the same device hardware (V_bank, T_s, etc.) so no power
+    # splitting is needed — the cathode solver self-consistently determines currents.
     def _param_transform(params, flags, _sym=_is_symmetric):
-        P_in_MW = params.pop("P_in", PARAM_META["P_in"]["default"])
-        P_in_W = P_in_MW * 1e6  # convert MW → W
-        Vd = params.get("Vd", PARAM_META["Vd"]["default"])
         twin_active = flags.get("TwinCathode", False)
-
         if twin_active and _sym:
-            # Split total power equally; each cathode gets half the current
-            Id = P_in_W / (2.0 * Vd)
-            params["Id"] = Id
-            params["Twin_Id"] = Id
-            params["Twin_Vd"] = Vd
-            # Split gas puff and neutral source equally between cathodes
             params["S_gp"] = params.get("S_gp", PARAM_META["S_gp"]["default"]) / 2.0
             params["Twin_S_gp"] = params["S_gp"]
             params["Source_nn0"] = params.get("Source_nn0", PARAM_META["Source_nn0"]["default"]) / 2.0
             params["Twin_nn0"] = params["Source_nn0"]
-        else:
-            # Single cathode or asymmetric twin — primary drives full P_in
-            params["Id"] = P_in_W / Vd
-
         return params
 
     return param_ranges, flag_ranges, fixed_params, fixed_flags, _param_transform
@@ -882,18 +907,6 @@ def _index_to_df(idx):
             row[f"f:{k}"] = bool(arr[i]) if i < len(arr) else None
         for k, arr in idx["stats_10_20ms"].items():
             row[f"s:{k}"] = float(arr[i]) if i < len(arr) else None
-        # Derived: total input power in MW = (Id + Twin_Id) * Vd / 1e6
-        def _f0(v):
-            """Return float, treating None and NaN as 0."""
-            try:
-                f = float(v)
-                return 0.0 if np.isnan(f) else f
-            except (TypeError, ValueError):
-                return 0.0
-        Id = _f0(row.get("p:Id"))
-        Twin_Id = _f0(row.get("p:Twin_Id"))
-        Vd = _f0(row.get("p:Vd"))
-        row["P_total_MW"] = (Id + Twin_Id) * Vd / 1e6
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -966,40 +979,20 @@ def _render_configure_tab():
                     horizontal=True,
                     key="dc_type",
                     help=(
-                        "**Twin**: total power (P_in) and sources (S_gp, Source_nn0) are split "
-                        "equally between cathodes; Vd is shared.  "
-                        "**Asymmetric**: second cathode has fully independent controls."
+                        "**Twin**: sources (S_gp, Source_nn0) are split equally between cathodes; "
+                        "both share V_bank and hardware parameters.  "
+                        "**Asymmetric**: second cathode has independent neutral-side controls."
                     ),
                 )
                 if dc_type == "Twin (symmetric)":
-                    # Show live splitting values
-                    vd_mode = st.session_state.get("pmode_Vd", "Fixed")
-                    p_in_mode = st.session_state.get("pmode_P_in", "Fixed")
+                    # Show live splitting values for sources
                     s_gp_mode = st.session_state.get("pmode_S_gp", "Fixed")
                     snn0_mode = st.session_state.get("pmode_Source_nn0", "Fixed")
 
-                    vd = float(st.session_state.get("pfixed_Vd", PARAM_META["Vd"]["default"]))
-                    p_in = float(st.session_state.get("pfixed_P_in", PARAM_META["P_in"]["default"]))
                     s_gp = float(st.session_state.get("pfixed_S_gp", PARAM_META["S_gp"]["default"]))
                     s_nn0 = float(st.session_state.get("pfixed_Source_nn0", PARAM_META["Source_nn0"]["default"]))
 
                     lines = []
-                    # Twin_Vd = Vd (unchanged)
-                    if vd_mode == "Range":
-                        vd_min = st.session_state.get("pmin_Vd", vd)
-                        vd_max = st.session_state.get("pmax_Vd", vd)
-                        lines.append(f"- **Twin_Vd** = **Vd**  *(range {vd_min:g} → {vd_max:g} V)*")
-                    else:
-                        lines.append(f"- **Twin_Vd** = {vd:g} V  *(= Vd)*")
-                    # Id = Twin_Id = P_in / (2 × Vd)
-                    if p_in_mode == "Range" or vd_mode == "Range":
-                        lines.append("- **Id** = **Twin_Id** = P_in / (2×Vd)  *(computed per combination)*")
-                    else:
-                        id_split = p_in * 1e6 / (2.0 * vd)
-                        lines.append(
-                            f"- **Id** = **Twin_Id** = {_fmt_val(id_split)} A"
-                            f"  *(= {p_in:.3f} MW / (2×{vd:g} V))*"
-                        )
                     # S_gp split
                     if s_gp_mode == "Range":
                         sg_min = st.session_state.get("pmin_S_gp", s_gp)
@@ -1027,7 +1020,8 @@ def _render_configure_tab():
                             f"  *(= {_fmt_val(s_nn0)}/2 per cathode)*"
                         )
                     st.info(
-                        "Twin mode — power and sources split equally between cathodes:\n"
+                        "Twin mode — sources split equally between cathodes; "
+                        "both cathodes share V_bank and hardware parameters:\n"
                         + "\n".join(lines)
                     )
                 else:
@@ -1324,19 +1318,16 @@ def _render_explore_tab():
                 return bool(arr[_i]) if arr is not None and _i < len(arr) else default
 
             twin = _f("TwinCathode")
-            Id = _p("Id")
-            Vd = _p("Vd")
-            Twin_Id = _p("Twin_Id") if twin else 0.0
+            V_bank = _p("V_bank")
             S_gp = _p("S_gp")
             Twin_S_gp = _p("Twin_S_gp") if twin else 0.0
             gas = _p("gas_type", "?")
             if isinstance(gas, bytes):
                 gas = gas.decode()
-            P_MW = (Id + Twin_Id) * Vd / 1e6
             S_gp_total = S_gp + Twin_S_gp
             twin_str = "twin" if twin else "single"
             labels[run_id] = (
-                f"{run_id}  |  {gas}  P={P_MW:.2f} MW  "
+                f"{run_id}  |  {gas}  V_bank={V_bank:.0f}V  "
                 f"S_gp={S_gp_total:.0f}  [{twin_str}]"
             )
         return labels
@@ -1353,13 +1344,9 @@ def _render_explore_tab():
             for col in df.columns
             if col.startswith(("p:", "s:"))
         }
-        col_conf["P_total_MW"] = st.column_config.NumberColumn(
-            "P_total [MW]", format="%.3f"
-        )
         # Default visible columns; all columns still available in CSV export
-        _DEFAULT_PARAMS = ["Vd", "Twin_Vd", "Id", "Twin_Id", "gas_type",
-                           "nn0", "Source_nn0", "Twin_nn0"]
-        default_cols = ["run_id", "status", "n_cells", "P_total_MW"]
+        _DEFAULT_PARAMS = ["V_bank", "gas_type", "nn0", "Source_nn0", "Twin_nn0"]
+        default_cols = ["run_id", "status", "n_cells"]
         default_cols += [f"p:{k}" for k in _DEFAULT_PARAMS if f"p:{k}" in df.columns]
         default_cols += [c for c in df.columns if c.startswith("f:")]
         st.dataframe(df, width="stretch", height=500, column_config=col_conf,
@@ -1446,12 +1433,24 @@ def _render_explore_tab():
             if not all_keys:
                 st.info("No numeric varied parameters in the current selection.")
             else:
-                c1, c2, c3, c4 = st.columns(4)
+                _metric_opts = {
+                    "Spatial variance": "var",
+                    "Temporal variance": "tvar",
+                    "Total variance": "total_var",
+                    "Spatial CoV": "cov",
+                    "Temporal CoV": "tcov",
+                    "Mean": "mean",
+                }
+                c1, c2, c3, c4, c5 = st.columns(5)
                 x_param = c1.selectbox("X axis", all_keys, key="var_x")
                 hue_opts = ["None"] + all_keys
                 hue_param = c2.selectbox("Color by", hue_opts, key="var_hue")
                 quantity = c3.radio("Quantity", ["ne", "Te"], key="var_qty", horizontal=True)
-                plot_type = c4.radio("Plot type", ["Scatter", "Heatmap"], key="var_type", horizontal=True)
+                metric_label = c4.radio(
+                    "Metric", list(_metric_opts.keys()), key="var_metric", horizontal=False
+                )
+                metric_key = _metric_opts[metric_label]
+                plot_type = c5.radio("Plot type", ["Scatter", "Heatmap"], key="var_type", horizontal=True)
 
                 try:
                     if plot_type == "Scatter":
@@ -1459,6 +1458,7 @@ def _render_explore_tab():
                             filtered_idx, x_param,
                             hue_param=None if hue_param == "None" else hue_param,
                             quantity=quantity,
+                            metric=metric_key,
                         )
                         st.pyplot(fig, width="stretch")
                         plt.close(fig)
@@ -1468,7 +1468,7 @@ def _render_explore_tab():
                             st.info("Need at least 2 varied parameters for a heatmap.")
                         else:
                             y_param = st.selectbox("Y axis (heatmap)", y_param_opts, key="var_y")
-                            qty_key = f"{quantity}_var"
+                            qty_key = f"{quantity}_{metric_key}"
                             fig = plot_sweep_heatmap(filtered_idx, x_param, y_param, quantity=qty_key)
                             st.pyplot(fig, width="stretch")
                             plt.close(fig)

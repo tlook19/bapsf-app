@@ -8,7 +8,9 @@ sweep.h5
 ├── runs/
 │   ├── run_0000/
 │   │   ├── attrs: {param_*, flag_*, timestamp, status}
-│   │   ├── <result arrays>          # all keys from get_results()
+│   │   ├── <result arrays>          # all keys from get_results(); cell arrays padded to max_cells with NaN
+│   │   ├── cells_at_time            # (n_timesteps,) int — active cell count at each recorded step
+│   │   ├── refinement_events        # (N, 3) float — columns: [t_ms, old_cells, new_cells]
 │   │   └── stats_10_20ms/
 │   │       └── attrs: {ne_var, ne_min, ...}
 │   └── run_0001/ ...
@@ -146,7 +148,11 @@ def save_run(db, run_id, params, flags, results, stats):
 
     # Store result arrays
     for key, val in results.items():
-        arr = np.asarray(val)
+        if key == "refinement_events":
+            # list of (t, old_cells, new_cells) tuples — convert to uniform (N, 3) float array
+            arr = np.array(val, dtype=float).reshape(-1, 3) if val else np.zeros((0, 3), dtype=float)
+        else:
+            arr = np.asarray(val)
         grp.create_dataset(key, data=arr, compression="gzip", compression_opts=4)
 
     # Store pre-computed stats as attrs on a subgroup
@@ -337,11 +343,29 @@ def rebuild_index(db):
         grp = db["runs"][run_id]
         status = grp.attrs.get("status", "ok")
 
-        n_cells = int(grp["ne"].shape[1]) if "ne" in grp else 0
+        if "cells_at_time" in grp and grp["cells_at_time"].shape[0] > 0:
+            n_cells = int(grp["cells_at_time"][:].max())
+        elif "ne" in grp:
+            n_cells = int(grp["ne"].shape[1])
+        else:
+            n_cells = 0
         params = {k[6:]: v for k, v in grp.attrs.items() if k.startswith("param_")}
         flags = {k[5:]: bool(v) for k, v in grp.attrs.items() if k.startswith("flag_")}
         stats = {}
         if "stats_10_20ms" in grp:
             stats = {k: float(v) for k, v in grp["stats_10_20ms"].attrs.items()}
+
+        # Recompute stats from raw arrays if any keys are missing (e.g. after schema update)
+        _required = {"ne_var", "ne_tvar", "ne_tcov", "ne_total_var", "Te_var", "Te_tvar", "Te_tcov", "Te_total_var"}
+        if status == "ok" and not _required.issubset(stats.keys()) and "ne" in grp and "time" in grp:
+            from bapsf_app.stats import compute_window_stats
+            try:
+                results = {k: grp[k][:] for k in ("time", "ne", "Te") if k in grp}
+                stats = compute_window_stats(results)
+                sg = grp.require_group("stats_10_20ms")
+                for k, v in stats.items():
+                    sg.attrs[k] = float(v)
+            except Exception:
+                pass
 
         update_index(db, run_id, params, flags, stats, n_cells, status)

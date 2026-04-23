@@ -46,12 +46,14 @@ def compute_window_stats(results, t_window=(10.0, 20.0)):
     Returns
     -------
     dict with keys:
-        ne_var   float  variance of per-cell time-means across cells
-        ne_cov   float  std(cell_means) / overall_mean (coefficient of variation)
+        ne_var   float  spatial variance: var of per-cell time-means across cells
+        ne_cov   float  spatial CoV: std(cell_means) / overall_mean
+        ne_tvar  float  temporal variance: mean of per-cell time-variances
+        ne_tcov  float  temporal CoV: mean of (per-cell std / per-cell mean)
         ne_min   float  minimum ne over all cells and all t in window
         ne_max   float  maximum ne over all cells and all t in window
         ne_mean  float  mean ne over all cells and all t in window
-        Te_var / Te_cov / Te_min / Te_max / Te_mean — same for Te
+        Te_var / Te_cov / Te_tvar / Te_tcov / Te_min / Te_max / Te_mean — same for Te
 
     Raises
     ------
@@ -71,13 +73,26 @@ def compute_window_stats(results, t_window=(10.0, 20.0)):
     stats = {}
     for key in ("ne", "Te"):
         arr = results[key][mask]  # (n_t_window, n_cells)
-        cell_means = arr.mean(axis=0)  # mean over time, per cell; shape (n_cells,)
+        cell_means = arr.mean(axis=0)  # shape (n_cells,) — time-mean per cell
+        cell_vars = arr.var(axis=0)    # shape (n_cells,) — time-variance per cell
+        cell_stds = np.sqrt(cell_vars)
         overall_mean = float(arr.mean())
 
+        # Spatial: variability of steady-state values across cells
         stats[f"{key}_var"] = float(np.var(cell_means))
         stats[f"{key}_cov"] = (
             float(np.std(cell_means) / overall_mean) if overall_mean > 0 else 0.0
         )
+
+        # Temporal: fluctuation amplitude within the window, averaged over cells
+        stats[f"{key}_tvar"] = float(cell_vars.mean())
+        with np.errstate(invalid="ignore", divide="ignore"):
+            per_cell_tcov = np.where(cell_means > 0, cell_stds / cell_means, 0.0)
+        stats[f"{key}_tcov"] = float(per_cell_tcov.mean())
+
+        # Total: spatial + temporal (law of total variance)
+        stats[f"{key}_total_var"] = stats[f"{key}_var"] + stats[f"{key}_tvar"]
+
         stats[f"{key}_min"] = float(arr.min())
         stats[f"{key}_max"] = float(arr.max())
         stats[f"{key}_mean"] = overall_mean
