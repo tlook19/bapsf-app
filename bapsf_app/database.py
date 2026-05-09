@@ -8,9 +8,11 @@ sweep.h5
 ├── runs/
 │   ├── run_0000/
 │   │   ├── attrs: {param_*, flag_*, timestamp, status}
-│   │   ├── <result arrays>          # all keys from get_results(); cell arrays padded to max_cells with NaN
+│   │   ├── <result arrays>          # scalar fields from get_results(); cell arrays padded to max_cells with NaN
 │   │   ├── cells_at_time            # (n_timesteps,) int — active cell count at each recorded step
 │   │   ├── refinement_events        # (N, 3) float — columns: [t_ms, old_cells, new_cells]
+│   │   ├── cathode/                 # one dataset per _CATHODE_FIELDS entry, shape (n_timesteps,)
+│   │   ├── cathode_twin/            # same structure; all-NaN when TwinCathode=False
 │   │   └── stats_10_20ms/
 │   │       └── attrs: {ne_var, ne_min, ...}
 │   └── run_0001/ ...
@@ -146,14 +148,22 @@ def save_run(db, run_id, params, flags, results, stats):
     for k, v in flags.items():
         grp.attrs[f"flag_{k}"] = bool(v)
 
-    # Store result arrays
-    for key, val in results.items():
-        if key == "refinement_events":
+    # Store result arrays (results is a SimpleNamespace or dict)
+    result_items = vars(results).items() if not isinstance(results, dict) else results.items()
+    for key, val in result_items:
+        if key in ("cathode", "cathode_twin"):
+            # Each is a SimpleNamespace of per-field 1-D time-series arrays
+            cgrp = grp.create_group(key)
+            field_items = vars(val).items() if not isinstance(val, dict) else val.items()
+            for fname, farr in field_items:
+                cgrp.create_dataset(fname, data=np.asarray(farr), compression="gzip", compression_opts=4)
+        elif key == "refinement_events":
             # list of (t, old_cells, new_cells) tuples — convert to uniform (N, 3) float array
             arr = np.array(val, dtype=float).reshape(-1, 3) if val else np.zeros((0, 3), dtype=float)
+            grp.create_dataset(key, data=arr, compression="gzip", compression_opts=4)
         else:
             arr = np.asarray(val)
-        grp.create_dataset(key, data=arr, compression="gzip", compression_opts=4)
+            grp.create_dataset(key, data=arr, compression="gzip", compression_opts=4)
 
     # Store pre-computed stats as attrs on a subgroup
     sg = grp.create_group("stats_10_20ms")
@@ -194,7 +204,11 @@ def load_run(db, run_id, keys=None):
     results = {}
     for k in load_keys:
         if k in grp:
-            results[k] = grp[k][:]
+            item = grp[k]
+            if isinstance(item, h5py.Group):
+                results[k] = {fname: item[fname][:] for fname in item.keys()}
+            else:
+                results[k] = item[:]
 
     return params, flags, results
 
@@ -245,7 +259,14 @@ def update_index(db, run_id, params, flags, stats, n_cells, status="ok"):
                 val = float("nan")
         current_len = p_grp[k].shape[0] if k in p_grp else 0
         for _ in range(n_rows - 1 - current_len):
-            pad = "" if k in p_grp and p_grp[k].dtype.kind in ("S", "O", "U") else float("nan")
+            if k in p_grp and p_grp[k].dtype.kind in ("S", "O", "U"):
+                pad = ""
+            elif isinstance(val, str):
+                # Dataset not yet created; infer pad type from current value to avoid
+                # creating a float dataset that later rejects the string value.
+                pad = ""
+            else:
+                pad = float("nan")
             _append_dataset(p_grp, k, pad)
         _append_dataset(p_grp, k, val)
 
@@ -356,12 +377,15 @@ def rebuild_index(db):
             stats = {k: float(v) for k, v in grp["stats_10_20ms"].attrs.items()}
 
         # Recompute stats from raw arrays if any keys are missing (e.g. after schema update)
-        _required = {"ne_var", "ne_tvar", "ne_tcov", "ne_total_var", "Te_var", "Te_tvar", "Te_tcov", "Te_total_var"}
+        _required = {"ne_var", "ne_tvar", "ne_tcov", "ne_total_var", "Te_var", "Te_tvar", "Te_tcov", "Te_total_var", "P_net_mean", "P_eff", "P_net_total", "P_eff_total"}
         if status == "ok" and not _required.issubset(stats.keys()) and "ne" in grp and "time" in grp:
             from bapsf_app.stats import compute_window_stats
             try:
                 results = {k: grp[k][:] for k in ("time", "ne", "Te") if k in grp}
-                stats = compute_window_stats(results)
+                for ckey in ("cathode", "cathode_twin"):
+                    if ckey in grp:
+                        results[ckey] = {fname: grp[ckey][fname][:] for fname in grp[ckey].keys()}
+                stats = compute_window_stats(results)  # stats.py accepts dict via _get helper
                 sg = grp.require_group("stats_10_20ms")
                 for k, v in stats.items():
                     sg.attrs[k] = float(v)

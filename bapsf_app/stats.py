@@ -38,10 +38,10 @@ def compute_window_stats(results, t_window=(10.0, 20.0)):
 
     Parameters
     ----------
-    results : dict
+    results : SimpleNamespace or dict
         Output of ``sim.get_results()``.  Time array must be in milliseconds.
     t_window : tuple of float
-        (t_start, t_end) in ms.
+        (t_start, t_end) in ms, relative to breakdown (t=0 at breakdown).
 
     Returns
     -------
@@ -60,7 +60,8 @@ def compute_window_stats(results, t_window=(10.0, 20.0)):
     ValueError
         If no timesteps fall inside t_window.
     """
-    t = results["time"]
+    _get = (lambda k: results[k]) if isinstance(results, dict) else (lambda k: getattr(results, k))
+    t = _get("time")
     t_start, t_end = t_window
     mask = (t >= t_start) & (t <= t_end)
 
@@ -72,19 +73,26 @@ def compute_window_stats(results, t_window=(10.0, 20.0)):
 
     stats = {}
     for key in ("ne", "Te"):
-        arr = results[key][mask]  # (n_t_window, n_cells)
-        cell_means = arr.mean(axis=0)  # shape (n_cells,) — time-mean per cell
-        cell_vars = arr.var(axis=0)    # shape (n_cells,) — time-variance per cell
-        cell_stds = np.sqrt(cell_vars)
-        overall_mean = float(arr.mean())
+        arr = _get(key)[mask]  # (n_t_window, n_cells)
+        n_cells = arr.shape[1]
 
-        # Spatial: variability of steady-state values across cells
+        # Exclude cathode/boundary cells (first and last) from variation analysis.
+        # Both ends are boundary-condition dominated and skew spatial stats.
+        interior = slice(1, -1) if n_cells > 2 else slice(None)
+        arr_i = arr[:, interior]
+
+        cell_means = arr_i.mean(axis=0)
+        cell_vars = arr_i.var(axis=0)
+        cell_stds = np.sqrt(cell_vars)
+        overall_mean = float(arr_i.mean())
+
+        # Spatial: variability of steady-state values across interior cells
         stats[f"{key}_var"] = float(np.var(cell_means))
         stats[f"{key}_cov"] = (
             float(np.std(cell_means) / overall_mean) if overall_mean > 0 else 0.0
         )
 
-        # Temporal: fluctuation amplitude within the window, averaged over cells
+        # Temporal: fluctuation amplitude within the window, averaged over interior cells
         stats[f"{key}_tvar"] = float(cell_vars.mean())
         with np.errstate(invalid="ignore", divide="ignore"):
             per_cell_tcov = np.where(cell_means > 0, cell_stds / cell_means, 0.0)
@@ -93,8 +101,61 @@ def compute_window_stats(results, t_window=(10.0, 20.0)):
         # Total: spatial + temporal (law of total variance)
         stats[f"{key}_total_var"] = stats[f"{key}_var"] + stats[f"{key}_tvar"]
 
-        stats[f"{key}_min"] = float(arr.min())
-        stats[f"{key}_max"] = float(arr.max())
+        stats[f"{key}_min"] = float(arr_i.min())
+        stats[f"{key}_max"] = float(arr_i.max())
         stats[f"{key}_mean"] = overall_mean
+
+    # Cathode power stats: P_net_mean and P_eff = P_net_mean / P_wall_mean
+    try:
+        cathode_obj = _get("cathode")
+        _cget = (
+            (lambda k: cathode_obj[k])
+            if isinstance(cathode_obj, dict)
+            else (lambda k: getattr(cathode_obj, k))
+        )
+        p_net_mean = float(_cget("P_net")[mask].mean())
+        p_wall_mean = float(_cget("P_wall")[mask].mean())
+        stats["P_net_mean"] = p_net_mean
+        stats["P_eff"] = p_net_mean / p_wall_mean if p_wall_mean != 0 else float("nan")
+    except (KeyError, AttributeError, TypeError, IndexError):
+        p_net_mean = float("nan")
+        p_wall_mean = float("nan")
+        stats["P_net_mean"] = p_net_mean
+        stats["P_eff"] = float("nan")
+
+    # Twin cathode power stats (all-NaN arrays when TwinCathode=False)
+    try:
+        twin_obj = _get("cathode_twin")
+        _tget = (
+            (lambda k: twin_obj[k])
+            if isinstance(twin_obj, dict)
+            else (lambda k: getattr(twin_obj, k))
+        )
+        twin_p_net = _tget("P_net")[mask]
+        twin_p_wall = _tget("P_wall")[mask]
+        if np.all(np.isnan(twin_p_net)):
+            p_net_mean_twin = float("nan")
+            p_wall_mean_twin = float("nan")
+        else:
+            p_net_mean_twin = float(np.nanmean(twin_p_net))
+            p_wall_mean_twin = float(np.nanmean(twin_p_wall))
+    except (KeyError, AttributeError, TypeError, IndexError):
+        p_net_mean_twin = float("nan")
+        p_wall_mean_twin = float("nan")
+
+    # Totals across both cathodes
+    have_primary = not np.isnan(p_net_mean)
+    have_twin = not np.isnan(p_net_mean_twin)
+    if have_primary and have_twin:
+        p_net_total = p_net_mean + p_net_mean_twin
+        p_wall_total = p_wall_mean + p_wall_mean_twin
+        stats["P_net_total"] = p_net_total
+        stats["P_eff_total"] = p_net_total / p_wall_total if p_wall_total != 0 else float("nan")
+    elif have_primary:
+        stats["P_net_total"] = p_net_mean
+        stats["P_eff_total"] = stats["P_eff"]
+    else:
+        stats["P_net_total"] = float("nan")
+        stats["P_eff_total"] = float("nan")
 
     return stats

@@ -9,6 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
+# Activate environment
+conda activate fenicsx-env
+
 # Install dependencies (requires cablp sibling package at ../bapsf-transport/cablp)
 poetry install
 
@@ -91,6 +94,8 @@ sweep.h5
 │   │   ├── <result arrays> (ne, nn, Te, Ti, v_plasma, isat, ...) — gzip level 4
 │   │   ├── cells_at_time (n_timesteps,)
 │   │   ├── refinement_events (N, 3): [t_ms, old_cells, new_cells]
+│   │   ├── cathode/ — one dataset per field (n_timesteps,): phi_c_plus, phi_c_minus, phi_c, phi_a, V_p, V_b, R_p, I_i, I_e, I_eth, I_eth_star, I_tot, P_wall, P_load, P_comp, P_prim, P_ohmic, P_cathode_e, P_cathode_i, P_anode_e, P_anode_i, P_net, P_net2, P_loss
+│   │   ├── cathode_twin/ — same structure; all-NaN when TwinCathode=False
 │   │   └── stats_10_20ms/ attrs: {ne_var, ne_tvar, ne_tcov, ne_total_var, ne_min, ne_max, ne_mean, Te_*}
 └── index/
     ├── run_ids, status, n_cells   (resizable)

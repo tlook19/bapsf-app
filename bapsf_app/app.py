@@ -16,6 +16,15 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+if "MPLCONFIGDIR" not in os.environ:
+    _mpl_config_dir = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "bapsf_app_matplotlib"
+    _mpl_config_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(_mpl_config_dir)
+if "XDG_CACHE_HOME" not in os.environ:
+    _xdg_cache_dir = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "bapsf_app_cache"
+    _xdg_cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["XDG_CACHE_HOME"] = str(_xdg_cache_dir)
+
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -73,11 +82,16 @@ def _render_path_input(key: str, label: str, default: str, file_ext: str = ".h5"
     Returns the current path value (unexpanded, as the user typed it).
     """
     txt_key = f"_pathtxt_{key}"
+    pending_key = f"_pathtxt_pending_{key}"
     dir_key = f"_pathdir_{key}"
     show_key = f"_pathshow_{key}"
 
     if txt_key not in st.session_state:
         st.session_state[txt_key] = default
+    # Apply pending selection from file browser before the widget renders
+    if pending_key in st.session_state:
+        st.session_state[txt_key] = st.session_state[pending_key]
+        del st.session_state[pending_key]
 
     col_input, col_btn = st.columns([8, 1])
     with col_input:
@@ -125,7 +139,7 @@ def _render_path_input(key: str, label: str, default: str, file_ext: str = ".h5"
 
             for f_entry in files:
                 if st.button(f"📄 {f_entry.name}", key=f"_pf_{key}_{f_entry.name}"):
-                    st.session_state[txt_key] = str(f_entry)
+                    st.session_state[pending_key] = str(f_entry)
                     st.session_state[show_key] = False
                     st.rerun()
 
@@ -138,7 +152,7 @@ def _render_path_input(key: str, label: str, default: str, file_ext: str = ".h5"
             )
             if nc2.button("Use", key=f"_puse_{key}") and new_name:
                 fn = new_name if new_name.endswith(file_ext) else new_name + file_ext
-                st.session_state[txt_key] = str(cur_dir / fn)
+                st.session_state[pending_key] = str(cur_dir / fn)
                 st.session_state[show_key] = False
                 st.rerun()
 
@@ -222,15 +236,6 @@ PARAM_META: dict[str, dict] = {
         "label": "Plasma radius (Rp)", "unit": "cm", "default": 18.0,
         "type": "float", "group": "Machine Geometry",
     },
-    "Rhf": {
-        "label": "Radial heat flux scale length (Rhf)", "unit": "cm", "default": 50.0,
-        "type": "float", "group": "Machine Geometry",
-    },
-    # ── Magnetic Field ────────────────────────────────────────────────────────
-    "Bz0": {
-        "label": "Axial magnetic field (Bz0)", "unit": "G", "default": 1500.0,
-        "type": "float", "group": "Magnetic Field",
-    },
     # ── Discharge (Primary Cathode) ───────────────────────────────────────────
     "V_bank": {
         "label": "Power supply voltage (V_bank)", "unit": "V", "default": 100.0,
@@ -241,7 +246,7 @@ PARAM_META: dict[str, dict] = {
         "type": "float", "group": "Discharge (Primary Cathode)",
     },
     "T_s": {
-        "label": "Cathode surface temperature (T_s)", "unit": "K", "default": 1900.0,
+        "label": "Cathode surface temperature (T_s)", "unit": "°C", "default": 1626.85,
         "type": "float", "group": "Discharge (Primary Cathode)",
     },
     # ── Cathode Hardware ──────────────────────────────────────────────────────
@@ -270,10 +275,6 @@ PARAM_META: dict[str, dict] = {
         "type": "float", "group": "Cathode Hardware",
     },
     # ── Source / Sinks ────────────────────────────────────────────────────────
-    "Source_nn0": {
-        "label": "Source neutral density (Source_nn0)", "unit": "cm⁻³", "default": 1.2e13,
-        "type": "float", "group": "Source / Sinks",
-    },
     "S_pump_L": {
         "label": "Pump sink rate left (S_pump_L)", "unit": "s⁻¹", "default": 4000.0,
         "type": "float", "group": "Source / Sinks",
@@ -303,28 +304,44 @@ PARAM_META: dict[str, dict] = {
         "label": "MFP coarsen threshold", "unit": "", "default": 2.0,
         "type": "float", "group": "Time & Solver",
     },
-    "end": {
-        "label": "End time (end)", "unit": "s", "default": 21e-3,
+    "tau_prebreakdown": {
+        "label": "Pre-breakdown timeout (tau_prebreakdown)", "unit": "s", "default": 0.05,
         "type": "float", "group": "Time & Solver",
     },
-    "d_off": {
-        "label": "Discharge off time (d_off)", "unit": "s", "default": 20e-3,
+    "tau_discharge": {
+        "label": "Discharge duration (tau_discharge)", "unit": "s", "default": 20e-3,
         "type": "float", "group": "Time & Solver",
     },
-    "dt_main": {
-        "label": "Main time step (dt_main)", "unit": "s", "default": 3e-8,
+    "tau_afterglow": {
+        "label": "Afterglow duration (tau_afterglow)", "unit": "s", "default": 5e-3,
         "type": "float", "group": "Time & Solver",
     },
-    "dt_after": {
-        "label": "Time step after discharge (dt_after)", "unit": "s", "default": 1e-7,
+    "tau_cycle": {
+        "label": "Cycle length, Plasma=False (tau_cycle)", "unit": "s", "default": 3.0,
         "type": "float", "group": "Time & Solver",
     },
-    "tau_I_on": {
-        "label": "Beam current rise time (tau_I_on)", "unit": "s", "default": 0.001,
+    "I_prebreakdown": {
+        "label": "Pre-breakdown exit current (I_prebreakdown)", "unit": "A", "default": 0.0,
+        "type": "float", "group": "Time & Solver",
+    },
+    "I_breakdown": {
+        "label": "Breakdown current threshold (I_breakdown)", "unit": "A", "default": 1000.0,
+        "type": "float", "group": "Time & Solver",
+    },
+    "h0": {
+        "label": "Initial step size (h0)", "unit": "s", "default": 1e-6,
+        "type": "float", "group": "Time & Solver",
+    },
+    "h_max_discharge": {
+        "label": "Max step, discharge (h_max_discharge)", "unit": "s", "default": 1e-4,
+        "type": "float", "group": "Time & Solver",
+    },
+    "h_max_afterglow": {
+        "label": "Max step, afterglow (h_max_afterglow)", "unit": "s", "default": 1e-4,
         "type": "float", "group": "Time & Solver",
     },
     "cycles": {
-        "label": "Discharge cycles", "unit": "", "default": 1,
+        "label": "Equilibration cycles (Plasma=False)", "unit": "", "default": 1,
         "type": "int", "group": "Time & Solver",
     },
     "rtol": {
@@ -335,11 +352,13 @@ PARAM_META: dict[str, dict] = {
         "label": "Min step size (h_min)", "unit": "s", "default": 1e-12,
         "type": "float", "group": "Time & Solver",
     },
+    "h_min_prebreakdown": {
+        "label": "Min step, pre-breakdown (h_min_prebreakdown)", "unit": "s", "default": 1e-6,
+        "type": "float", "group": "Time & Solver",
+    },
     # ── Transport Scaling ─────────────────────────────────────────────────────
     "b_epara": {"label": "e⁻ parallel scale (b_epara)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_ipara": {"label": "Ion parallel scale (b_ipara)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
-    "b_eperp": {"label": "e⁻ perp scale (b_eperp)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
-    "b_iperp": {"label": "Ion perp scale (b_iperp)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_ioniz": {"label": "Ionization scale (b_ioniz)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_rec_rad": {"label": "Rad recombination scale (b_rec_rad)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_rec_3b": {"label": "3-body recombination scale (b_rec_3b)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
@@ -354,31 +373,24 @@ PARAM_META: dict[str, dict] = {
 # Both cathodes share the same device hardware (V_bank, T_s, etc.); only
 # the neutral-side initial conditions differ per cathode.
 TWIN_META: dict[str, dict] = {
-    "Twin_nn0": {"label": "Twin neutral density (Twin_nn0)", "unit": "cm⁻³", "default": 1.2e13, "type": "float"},
     "Twin_S_gp": {"label": "Twin gas puff rate (Twin_S_gp)", "unit": "", "default": 500.0, "type": "float"},
 }
 
 FLAG_META: dict[str, dict] = {
-    "eperp": {"label": "Electron perp transport", "default": False, "group": "Transport"},
-    "iperp": {"label": "Ion perp transport", "default": False, "group": "Transport"},
     "icool": {"label": "Ion cooling", "default": True, "group": "Physics"},
     "ncool": {"label": "Neutral cooling", "default": True, "group": "Physics"},
     "cx": {"label": "Charge exchange", "default": True, "group": "Physics"},
     "icool_recomb": {"label": "Ion cooling from recombination", "default": False, "group": "Physics"},
-    "mit_el": {"label": "MIT electron flag (mit_el)", "default": False, "group": "Physics"},
-    "C_imp": {"label": "Carbon impurity (C_imp)", "default": False, "group": "Physics"},
-    "O_imp": {"label": "Oxygen impurity (O_imp)", "default": False, "group": "Physics"},
     "Plasma": {"label": "Plasma physics", "default": True, "group": "Simulation"},
     "Velocity": {"label": "Plasma velocity", "default": True, "group": "Simulation"},
-    "breakdown_vel": {"label": "Diffusive flux during breakdown", "default": True, "group": "Simulation"},
-    "adaptive": {"label": "Adaptive time stepping (RK45)", "default": False, "group": "Simulation"},
-    "adaptive_mesh": {"label": "Adaptive spatial mesh", "default": True, "group": "Simulation"},
+    "advection": {"label": "Convective v·∇v acceleration", "default": True, "group": "Simulation"},
+    "hybrid_ne": {"label": "Hybrid density flux (sonic correction)", "default": True, "group": "Simulation"},
+    "adaptive_mesh": {"label": "Adaptive spatial mesh", "default": False, "group": "Simulation"},
 }
 
 PARAM_GROUP_ORDER = [
     "Gas & Initial Conditions",
     "Machine Geometry",
-    "Magnetic Field",
     "Discharge (Primary Cathode)",
     "Cathode Hardware",
     "Source / Sinks",
@@ -386,7 +398,9 @@ PARAM_GROUP_ORDER = [
     "Transport Scaling",
 ]
 
-FLAG_GROUP_ORDER = ["Transport", "Physics", "Simulation"]
+FLAG_GROUP_ORDER = ["Physics", "Simulation"]
+
+_ADAPTIVE_MESH_PARAMS = {"max_cells", "min_cells", "mfp_refine_threshold", "mfp_coarsen_threshold"}
 
 
 # ── Config persistence ─────────────────────────────────────────────────────────
@@ -401,7 +415,7 @@ for _k in list(PARAM_META.keys()) + list(TWIN_META.keys()):
         f"pmin_{_k}", f"pmax_{_k}", f"pstep_{_k}", f"pvary_{_k}",
     ]
 _FLAG_CFG_KEYS: list[str] = [f"flag_{k}" for k in FLAG_META]
-_MISC_CFG_KEYS: list[str] = ["dc_on_off", "dc_type", "pfixed_dt_max"]
+_MISC_CFG_KEYS: list[str] = ["dc_on_off", "dc_type"]
 _ALL_CFG_KEYS: list[str] = _PARAM_CFG_KEYS + _FLAG_CFG_KEYS + _MISC_CFG_KEYS
 
 
@@ -431,8 +445,10 @@ def _get_serializable_state() -> dict:
 
 def _apply_state(data: dict) -> None:
     """Write config data to session_state so widgets pick it up on next render."""
+    valid = set(_ALL_CFG_KEYS)
     for key, val in data.items():
-        st.session_state[key] = val
+        if key in valid:
+            st.session_state[key] = val
 
 
 def _save_config(path: pathlib.Path = _CONFIG_PATH) -> None:
@@ -481,6 +497,8 @@ class SweepState:
     total_time_s: float = 0.0
     db_path: str = ""
     planned_run_ids: list = field(default_factory=list)
+    active_runs: dict = field(default_factory=dict)   # run_id -> {start_time, label}
+    completed_run_times: list = field(default_factory=list)
 
 
 # ── Session state helpers ──────────────────────────────────────────────────────
@@ -610,7 +628,7 @@ def _build_sweep_config():
 
     param_transforms is a callable ``(params, flags) -> params`` applied by the
     sweep engine after building each run's full params dict.  In symmetric twin
-    mode it splits neutral sources (S_gp, Source_nn0) equally between cathodes.
+    mode it splits S_gp equally between cathodes.
     """
     param_ranges = {}
     fixed_params = {}
@@ -667,15 +685,6 @@ def _build_sweep_config():
                     else:
                         fixed_params[key] = TWIN_META[key]["default"]
 
-    # When adaptive stepping is on, dt_max overrides dt_main and dt_after
-    if st.session_state.get("flagcfg_adaptive") == "True":
-        dt_max = st.session_state.get("param_dt_max", {}).get("value", 1e-2)
-        fixed_params["dt_main"] = dt_max
-        fixed_params["dt_after"] = dt_max
-        # Remove stale values that PARAM_META processing may have set
-        param_ranges.pop("dt_main", None)
-        param_ranges.pop("dt_after", None)
-
     # Regular flags
     for key in FLAG_META:
         choice = st.session_state.get(f"flagcfg_{key}", "False" if not FLAG_META[key]["default"] else "True")
@@ -687,16 +696,16 @@ def _build_sweep_config():
             flag_ranges[key] = [True, False]
 
     # Build param_transforms closure.
-    # In symmetric twin mode, splits gas puff and neutral source equally between cathodes.
+    # In symmetric twin mode, splits gas puff equally between cathodes.
     # Both cathodes share the same device hardware (V_bank, T_s, etc.) so no power
     # splitting is needed — the cathode solver self-consistently determines currents.
     def _param_transform(params, flags, _sym=_is_symmetric):
+        # T_s is entered in °C; simulator expects K
+        params["T_s"] = params.get("T_s", PARAM_META["T_s"]["default"]) + 273.15
         twin_active = flags.get("TwinCathode", False)
         if twin_active and _sym:
             params["S_gp"] = params.get("S_gp", PARAM_META["S_gp"]["default"]) / 2.0
             params["Twin_S_gp"] = params["S_gp"]
-            params["Source_nn0"] = params.get("Source_nn0", PARAM_META["Source_nn0"]["default"]) / 2.0
-            params["Twin_nn0"] = params["Source_nn0"]
         return params
 
     return param_ranges, flag_ranges, fixed_params, fixed_flags, _param_transform
@@ -784,34 +793,90 @@ def _drain_queue():
                     "log": state.log[-50:],
                 })
         else:
-            state.completed = msg.get("i", state.completed)
             state.total = msg.get("total", state.total)
             run_id = msg.get("run_id", "")
             status = msg.get("status", "ok")
-            if status == "failed":
-                state.failed += 1
             stats = msg.get("stats", {})
-            ne_var = stats.get("ne_var", float("nan"))
-            run_time = stats.get("_run_time_s")
-            equil_time = stats.get("_equil_time_s")
-            equil_cache_hit = stats.get("_equil_cache_hit", False)
-            equil_S_gp = stats.get("_equil_S_gp")
-            equil_twin = stats.get("_equil_twin", False)
-            equil_Twin_S_gp = stats.get("_equil_Twin_S_gp")
-            do_equil = stats.get("_equilibrate_nn", False)
 
-            line = f"[{state.completed}/{state.total}] {run_id} {status}"
-            if not np.isnan(ne_var):
-                line += f"  ne_var={ne_var:.3e}"
-            if run_time is not None:
-                line += f"  run={run_time:.1f}s"
-            if do_equil and equil_S_gp is not None:
-                twin_str = f"/twin={equil_Twin_S_gp:.0f}" if equil_twin else ""
-                if equil_cache_hit:
-                    line += f"  equil=cached(S_gp={equil_S_gp:.0f}{twin_str})"
-                else:
-                    line += f"  equil={equil_time:.1f}s(fresh,S_gp={equil_S_gp:.0f}{twin_str})"
-            state.log.append(line)
+            if status == "starting":
+                start_time = stats.get("_start_time", time.time())
+                v_bank = stats.get("_V_bank")
+                t_s_k = stats.get("_T_s_K")
+                s_gp = stats.get("_S_gp")
+                cells = stats.get("_cells")
+                twin = stats.get("_TwinCathode", False)
+                twin_s_gp = stats.get("_Twin_S_gp")
+                parts = []
+                if v_bank is not None:
+                    parts.append(f"V_bank={v_bank:.0f}V")
+                if s_gp is not None:
+                    parts.append(f"S_gp={s_gp:.0f}")
+                if cells is not None:
+                    parts.append(f"cells={cells}")
+                if t_s_k is not None:
+                    parts.append(f"T_s={t_s_k - 273.15:.0f}°C")
+                if twin:
+                    twin_s_str = f"/{twin_s_gp:.0f}" if twin_s_gp is not None else ""
+                    parts.append(f"Twin=on{twin_s_str}")
+                label = "  ".join(parts) or run_id
+                state.active_runs[run_id] = {
+                    "start_time": start_time,
+                    "label": label,
+                    "t_total_ms": stats.get("_t_total_ms", 25.0),
+                    "frac": 0.0,
+                    "phase_code": 0.0,
+                    "seg_wall": 0.0,
+                    "rate_ema": 0.0,
+                }
+            elif status == "progress":
+                if run_id in state.active_runs:
+                    info = state.active_runs[run_id]
+                    info["frac"] = stats.get("frac", info["frac"])
+                    info["phase_code"] = stats.get("phase_code", info["phase_code"])
+                    info["seg_wall"] = stats.get("seg_wall", info["seg_wall"])
+                    info["rate_ema"] = stats.get("rate_ema", info["rate_ema"])
+            else:
+                state.completed = msg.get("i", state.completed)
+                state.active_runs.pop(run_id, None)
+                if status == "failed":
+                    state.failed += 1
+                ne_var = stats.get("ne_var", float("nan"))
+                run_time = stats.get("_run_time_s")
+                if run_time is not None and status == "ok":
+                    state.completed_run_times.append(run_time)
+                equil_time = stats.get("_equil_time_s")
+                equil_cache_hit = stats.get("_equil_cache_hit", False)
+                equil_S_gp = stats.get("_equil_S_gp")
+                equil_twin = stats.get("_equil_twin", False)
+                equil_Twin_S_gp = stats.get("_equil_Twin_S_gp")
+                do_equil = stats.get("_equilibrate_nn", False)
+                v_bank = stats.get("_V_bank")
+                t_s_k = stats.get("_T_s_K")
+                twin_cathode = stats.get("_TwinCathode", False)
+
+                line = f"[{state.completed}/{state.total}] {run_id} {status}"
+                param_parts = []
+                if v_bank is not None:
+                    param_parts.append(f"V_bank={v_bank:.0f}V")
+                if t_s_k is not None:
+                    param_parts.append(f"T_s={t_s_k - 273.15:.0f}°C")
+                param_parts.append(f"Twin={'on' if twin_cathode else 'off'}")
+                line += "  " + "  ".join(param_parts)
+                if not np.isnan(ne_var):
+                    line += f"  ne_var={ne_var:.3e}"
+                if run_time is not None:
+                    line += f"  run={run_time:.1f}s"
+                if do_equil and equil_S_gp is not None:
+                    twin_str = f"/twin={equil_Twin_S_gp:.0f}" if equil_twin else ""
+                    if equil_cache_hit:
+                        line += f"  equil=cached(S_gp={equil_S_gp:.0f}{twin_str})"
+                    else:
+                        line += f"  equil={equil_time:.1f}s(fresh,S_gp={equil_S_gp:.0f}{twin_str})"
+                if status == "failed":
+                    error_msg = stats.get("_error", "")
+                    if error_msg:
+                        line += f"  → {error_msg}"
+                state.log.append(line)
 
     # Persist progress to manifest every time something changed
     if changed and state.running and state.db_path:
@@ -908,7 +973,10 @@ def _index_to_df(idx):
         for k, arr in idx["stats_10_20ms"].items():
             row[f"s:{k}"] = float(arr[i]) if i < len(arr) else None
         rows.append(row)
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if "p:T_s" in df.columns:
+        df["p:T_s_C"] = df["p:T_s"] - 273.15
+    return df
 
 
 # ── Tab renderers ─────────────────────────────────────────────────────────────
@@ -933,9 +1001,6 @@ def _render_configure_tab():
 
     col_params, col_flags = st.columns([3, 2])
 
-    # Read adaptive flag state persisted from previous render
-    _adaptive_on = st.session_state.get("flagcfg_adaptive", "False") == "True"
-
     with col_params:
         for group in PARAM_GROUP_ORDER:
             expanded = group in ("Discharge (Primary Cathode)", "Gas & Initial Conditions")
@@ -943,21 +1008,9 @@ def _render_configure_tab():
                 for key, meta in PARAM_META.items():
                     if meta["group"] != group:
                         continue
-                    # When adaptive stepping is active, dt_main and dt_after are
-                    # replaced by a single dt_max input rendered below
-                    if _adaptive_on and key in ("dt_main", "dt_after"):
+                    if key in _ADAPTIVE_MESH_PARAMS and st.session_state.get("flagcfg_adaptive_mesh", "False") == "False":
                         continue
                     _render_param_row(key, meta)
-
-                if group == "Time & Solver" and _adaptive_on:
-                    st.markdown("**Max adaptive step (dt_max)**  [s]")
-                    dt_max_val = st.number_input(
-                        "##dt_max", value=1e-2, format="%.3e",
-                        label_visibility="collapsed", key="pfixed_dt_max",
-                        min_value=1e-30,
-                    )
-                    _set_ss("param_dt_max", {"mode": "fixed", "value": dt_max_val})
-                    st.divider()
 
         # Dual Cathode section
         with st.expander("Dual Cathode", expanded=False):
@@ -979,50 +1032,32 @@ def _render_configure_tab():
                     horizontal=True,
                     key="dc_type",
                     help=(
-                        "**Twin**: sources (S_gp, Source_nn0) are split equally between cathodes; "
+                        "**Twin**: S_gp is split equally between cathodes; "
                         "both share V_bank and hardware parameters.  "
-                        "**Asymmetric**: second cathode has independent neutral-side controls."
+                        "**Asymmetric**: second cathode has an independent gas puff rate."
                     ),
                 )
                 if dc_type == "Twin (symmetric)":
-                    # Show live splitting values for sources
+                    # Show live splitting values for S_gp
                     s_gp_mode = st.session_state.get("pmode_S_gp", "Fixed")
-                    snn0_mode = st.session_state.get("pmode_Source_nn0", "Fixed")
-
                     s_gp = float(st.session_state.get("pfixed_S_gp", PARAM_META["S_gp"]["default"]))
-                    s_nn0 = float(st.session_state.get("pfixed_Source_nn0", PARAM_META["Source_nn0"]["default"]))
 
-                    lines = []
-                    # S_gp split
                     if s_gp_mode == "Range":
                         sg_min = st.session_state.get("pmin_S_gp", s_gp)
                         sg_max = st.session_state.get("pmax_S_gp", s_gp)
-                        lines.append(
-                            f"- **S_gp** = **Twin_S_gp** = S_gp/2"
+                        info_line = (
+                            f"**S_gp** = **Twin_S_gp** = S_gp/2"
                             f"  *(range {sg_min/2:g} → {sg_max/2:g} per cathode)*"
                         )
                     else:
-                        lines.append(
-                            f"- **S_gp** = **Twin_S_gp** = {_fmt_val(s_gp/2)}"
+                        info_line = (
+                            f"**S_gp** = **Twin_S_gp** = {_fmt_val(s_gp/2)}"
                             f"  *(= {_fmt_val(s_gp)}/2 per cathode)*"
                         )
-                    # Source_nn0 split
-                    if snn0_mode == "Range":
-                        sn_min = st.session_state.get("pmin_Source_nn0", s_nn0)
-                        sn_max = st.session_state.get("pmax_Source_nn0", s_nn0)
-                        lines.append(
-                            f"- **Source_nn0** = **Twin_nn0** = Source_nn0/2"
-                            f"  *(range {sn_min/2:.3e} → {sn_max/2:.3e} per cathode)*"
-                        )
-                    else:
-                        lines.append(
-                            f"- **Source_nn0** = **Twin_nn0** = {_fmt_val(s_nn0/2)}"
-                            f"  *(= {_fmt_val(s_nn0)}/2 per cathode)*"
-                        )
                     st.info(
-                        "Twin mode — sources split equally between cathodes; "
+                        "Twin mode — gas puff split equally between cathodes; "
                         "both cathodes share V_bank and hardware parameters:\n"
-                        + "\n".join(lines)
+                        f"- {info_line}"
                     )
                 else:
                     st.markdown("**Second cathode parameters:**")
@@ -1096,9 +1131,9 @@ def _render_run_tab():
     n_workers = col1.number_input("Workers", min_value=1, max_value=max_workers,
                                   value=1, key="run_n_workers")
     with col2:
-        t_start = st.number_input("t_window start (ms)", min_value=0.0, value=10.0,
+        t_start = st.number_input("t_window start (ms, 0=breakdown)", min_value=0.0, value=10.0,
                                   key="run_t_start")
-        t_end = st.number_input("t_window end (ms)", min_value=0.0, value=20.0,
+        t_end = st.number_input("t_window end (ms, 0=breakdown)", min_value=0.0, value=20.0,
                                 key="run_t_end")
 
     # ── Reconnect / interrupt banner ──────────────────────────────────────────
@@ -1145,10 +1180,10 @@ def _render_run_tab():
         key="run_equilibrate_nn",
         help=(
             "Before each plasma-on run, automatically determine the equilibrium background "
-            "neutral density by running 100 plasma-off cycles (3 s each, S_gp active first "
-            "20 ms per cycle, adaptive dt ≤ 10 ms) starting from nn0 = 1×10⁸ cm⁻³.  "
-            "Only nn0 (interior cells mean) is updated from the result.  "
-            "Source_nn0 and Twin_nn0 are left as configured."
+            "neutral density by running 100 plasma-off cycles (tau_cycle = 3 s each, "
+            "S_gp active for tau_discharge = 20 ms per cycle, h_max = 10 ms) "
+            "starting from nn0 = 1×10⁸ cm⁻³.  "
+            "nn0 is set to the equilibrated interior-cell mean."
         ),
     )
 
@@ -1234,6 +1269,38 @@ def _render_run_tab():
 
         st.divider()
 
+        # ── Active runs widget ─────────────────────────────────────────────────
+        _PHASE_NAMES = {0.0: "pre-breakdown", 1.0: "main discharge", 2.0: "afterglow"}
+        now = time.time()
+        if state.active_runs:
+            st.caption(f"Active runs ({len(state.active_runs)})")
+            for rid, info in state.active_runs.items():
+                elapsed = now - info["start_time"]
+                frac = info["frac"]
+                phase_str = _PHASE_NAMES.get(info["phase_code"], "pre-breakdown")
+                seg_wall = info["seg_wall"]
+                rate_ema = info["rate_ema"]
+                seg_str = f"  last 1ms: {seg_wall:.2f}s" if seg_wall > 0 else ""
+                if rate_ema > 0 and frac > 0:
+                    remaining_ms = (1.0 - frac) * info["t_total_ms"]
+                    eta_s = remaining_ms * rate_ema
+                    m, s = divmod(int(eta_s), 60)
+                    eta_str = f"  ETA {m}m{s:02d}s" if m else f"  ETA {s}s"
+                else:
+                    eta_str = ""
+                text = f"{rid}  {info['label']}  [{phase_str}]  {elapsed:.0f}s elapsed  {frac*100:.0f}%{seg_str}{eta_str}"
+                st.progress(frac, text=text)
+                if seg_wall > 30:
+                    import pathlib as _pl
+                    _db_dir = _pl.Path(state.db_path).expanduser().parent if state.db_path else _pl.Path("~").expanduser()
+                    _db_stem = _pl.Path(state.db_path).stem if state.db_path else "sweep"
+                    st.warning(
+                        f"{rid}: very slow — {seg_wall:.0f}s per 1ms of sim time. "
+                        f"Check worker logs for step size (h= lines): "
+                        f"`{_db_dir}/{_db_stem}.worker_*.log`  "
+                        "Possible causes: CFL-forced tiny steps, or resource contention."
+                    )
+
         progress_frac = state.completed / max(state.total, 1)
         st.progress(
             progress_frac,
@@ -1251,9 +1318,9 @@ def _render_run_tab():
         m3.metric("System RAM used", f"{sys_vm.percent:.0f}%")
         m4.metric("CPU", f"{psutil.cpu_percent(interval=None):.0f}%")
 
-        # Log
+        # Log — completions only
         log_text = "\n".join(state.log[-30:]) if state.log else "(waiting for first run…)"
-        st.text_area("Run log (last 30)", log_text, height=200)
+        st.text_area("Completed runs (last 30)", log_text, height=200)
 
         if state.running:
             time.sleep(0.5)
@@ -1319,6 +1386,7 @@ def _render_explore_tab():
 
             twin = _f("TwinCathode")
             V_bank = _p("V_bank")
+            T_s_k = _p("T_s", default=float("nan"))
             S_gp = _p("S_gp")
             Twin_S_gp = _p("Twin_S_gp") if twin else 0.0
             gas = _p("gas_type", "?")
@@ -1326,8 +1394,9 @@ def _render_explore_tab():
                 gas = gas.decode()
             S_gp_total = S_gp + Twin_S_gp
             twin_str = "twin" if twin else "single"
+            t_s_str = f"  T_s={T_s_k - 273.15:.0f}°C" if not np.isnan(T_s_k) else ""
             labels[run_id] = (
-                f"{run_id}  |  {gas}  V_bank={V_bank:.0f}V  "
+                f"{run_id}  |  {gas}  V_bank={V_bank:.0f}V{t_s_str}  "
                 f"S_gp={S_gp_total:.0f}  [{twin_str}]"
             )
         return labels
@@ -1344,8 +1413,9 @@ def _render_explore_tab():
             for col in df.columns
             if col.startswith(("p:", "s:"))
         }
+        col_conf["p:T_s_C"] = st.column_config.NumberColumn("T_s [°C]", format="%.0f")
         # Default visible columns; all columns still available in CSV export
-        _DEFAULT_PARAMS = ["V_bank", "gas_type", "nn0", "Source_nn0", "Twin_nn0"]
+        _DEFAULT_PARAMS = ["V_bank", "T_s_C", "gas_type", "nn0", "S_gp", "Twin_S_gp"]
         default_cols = ["run_id", "status", "n_cells"]
         default_cols += [f"p:{k}" for k in _DEFAULT_PARAMS if f"p:{k}" in df.columns]
         default_cols += [c for c in df.columns if c.startswith("f:")]

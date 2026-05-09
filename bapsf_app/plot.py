@@ -4,7 +4,7 @@ Visualization routines for LAPDSim results.
 Single-run plots
 ----------------
 ``plot_run(results, params, flags)`` is the main entry point.  It routes to
-2-D line plots (≤5 cells) or 3-D surface plots (>5 cells).
+2-D line plots (≤5 cells) or 2-D contour plots / position-vs-time heatmaps (>5 cells).
 
 Sweep analysis plots
 --------------------
@@ -20,10 +20,142 @@ import math
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import FuncFormatter
 
 from .stats import cell_centers
 
 _qe_SI = 1.602176634e-19  # J per eV
+
+# ── Contour plot helpers ──────────────────────────────────────────────────────
+
+_DENSE_MANTISSAS = np.array([
+    1., 1.125, 1.25, 1.375, 1.5, 1.75, 2., 2.25,
+    2.5, 2.75, 3., 3.5, 4., 4.5, 5., 6.25, 7.5, 8.75,
+])
+
+
+def _log_tick_label(v, pos=None):
+    value = 10 ** v
+    if not np.isfinite(value) or value <= 0:
+        return ""
+    exp = int(np.floor(np.log10(value)))
+    pref = value / (10 ** exp)
+    if np.isclose(pref, 1.0):
+        return rf"$10^{{{exp}}}$"
+    return rf"${pref:.1f}\times10^{{{exp}}}$"
+
+
+def _ratio_tick_label(v, pos=None):
+    value = 10 ** v
+    if not np.isfinite(value):
+        return ""
+    return f"{value:g}" if value >= 1 else f"{value:.3g}"
+
+
+def _linear_tick_label(v, pos=None):
+    return f"{v:g}"
+
+
+def _nice_log_levels(vmin_log, vmax_log, mantissas=(1, 2, 5)):
+    emin = int(np.floor(vmin_log))
+    emax = int(np.ceil(vmax_log))
+    vals = []
+    for exp in range(emin, emax + 1):
+        for m in mantissas:
+            v = np.log10(float(m)) + exp
+            if vmin_log - 1e-9 <= v <= vmax_log + 1e-9:
+                vals.append(v)
+    return np.array(vals) if vals else np.linspace(vmin_log, vmax_log, 5)
+
+
+def _nice_linear_levels(vmin, vmax, target=16):
+    if vmax <= vmin:
+        return np.array([vmin, vmax])
+    raw_step = (vmax - vmin) / max(target - 1, 1)
+    exp = np.floor(np.log10(max(abs(raw_step), 1e-30)))
+    frac = raw_step / 10 ** exp
+    if frac <= 1:
+        nf = 1.0
+    elif frac <= 2:
+        nf = 2.0
+    elif frac <= 2.5:
+        nf = 2.5
+    elif frac <= 5:
+        nf = 5.0
+    else:
+        nf = 10.0
+    step = nf * 10 ** exp
+    start = np.floor(vmin / step) * step
+    stop = np.ceil(vmax / step) * step
+    return np.arange(start, stop + 0.5 * step, step)
+
+
+def _contour_panel(ax, fig, Z_mesh, T_mesh, data, title, cbar_label,
+                   is_log=True, is_ratio=False, vmin=None, vmax=None,
+                   xlabel="Position [cm]", ylabel="Time [ms]"):
+    """Draw one filled-contour panel into *ax* with colorbar and overlaid contour lines."""
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        ax.set_title(title)
+        ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center")
+        return
+
+    vmin_plot = float(np.floor(np.nanmin(finite))) if vmin is None else float(vmin)
+    vmax_plot = float(np.ceil(np.nanmax(finite))) if vmax is None else float(vmax)
+    if vmin_plot >= vmax_plot:
+        vmax_plot = vmin_plot + 1.0
+
+    levels = np.linspace(vmin_plot, vmax_plot, 100)
+
+    if is_ratio:
+        line_values = np.array([
+            0.01, 0.015, 0.02, 0.03, 0.05, 0.07,
+            0.1, 0.15, 0.2, 0.3, 0.5, 0.7,
+            1, 1.5, 2, 3, 5, 7,
+            10, 15, 20, 30, 50, 70, 100,
+        ])
+        label_values = np.array([0.01, 0.02, 0.05, 0.1, 0.2, 0.5,
+                                  1, 2, 5, 10, 20, 50, 100])
+        line_levels = np.log10(line_values)
+        label_levels = np.log10(label_values)
+        cbar_ticks = label_levels
+        tick_fmt = FuncFormatter(_ratio_tick_label)
+    elif is_log:
+        line_levels = _nice_log_levels(vmin_plot, vmax_plot, _DENSE_MANTISSAS)
+        label_levels = _nice_log_levels(vmin_plot, vmax_plot, (1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 7.5))
+        cbar_ticks = _nice_log_levels(vmin_plot, vmax_plot, (1, 1.5, 2, 3, 5, 7))
+        tick_fmt = FuncFormatter(_log_tick_label)
+    else:
+        line_levels = _nice_linear_levels(vmin_plot, vmax_plot, target=16)
+        label_levels = _nice_linear_levels(vmin_plot, vmax_plot, target=8)
+        label_levels = np.array([
+            lev for lev in label_levels
+            if np.any(np.abs(lev - line_levels) < 1e-10)
+        ])
+        cbar_ticks = label_levels
+        tick_fmt = FuncFormatter(_linear_tick_label)
+
+    line_levels = line_levels[(line_levels >= vmin_plot) & (line_levels <= vmax_plot)]
+    label_levels = label_levels[(label_levels >= vmin_plot) & (label_levels <= vmax_plot)]
+    cbar_ticks = cbar_ticks[(cbar_ticks >= vmin_plot) & (cbar_ticks <= vmax_plot)]
+
+    cf = ax.contourf(Z_mesh, T_mesh, data, levels=levels, cmap="plasma", extend="both")
+    if line_levels.size >= 2:
+        cs = ax.contour(Z_mesh, T_mesh, data, levels=line_levels,
+                        colors="black", linewidths=0.8, alpha=0.9)
+        if label_levels.size:
+            ax.clabel(cs, levels=label_levels, inline=True, fontsize=6, fmt=tick_fmt)
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    cbar = fig.colorbar(cf, ax=ax)
+    cbar.set_label(cbar_label)
+    if cbar_ticks.size:
+        cbar.set_ticks(cbar_ticks)
+    cbar.ax.yaxis.set_major_formatter(tick_fmt)
+
 
 # ── Position helpers ──────────────────────────────────────────────────────────
 
@@ -58,17 +190,16 @@ def _z_axis_label(convention):
 def _run_title(params, flags):
     """One-line parameter summary for plot titles."""
     gas = params.get("gas_type", "?")
-    Vd = params.get("Vd", 0)
-    Id = params.get("Id", 0)
+    V_bank = params.get("V_bank", 0)
+    T_s_K = params.get("T_s", 0)
+    T_s_C = T_s_K - 273.15 if T_s_K else 0
     cells = params.get("cells", "?")
     twin_active = flags.get("TwinCathode", False)
-    Twin_Id = params.get("Twin_Id", 0.0) if twin_active else 0.0
     S_gp = params.get("S_gp", 0.0)
     Twin_S_gp = params.get("Twin_S_gp", 0.0) if twin_active else 0.0
-    P_MW = (Id + Twin_Id) * Vd / 1e6
     S_gp_total = S_gp + Twin_S_gp
     twin = "twin" if twin_active else "single"
-    return f"{gas}  Vd={Vd:.0f} V  P={P_MW:.2f} MW  S_gp={S_gp_total:.0f}  {cells} cells  [{twin}]"
+    return f"{gas}  V_bank={V_bank:.0f} V  T_s={T_s_C:.0f}°C  S_gp={S_gp_total:.0f}  {cells} cells  [{twin}]"
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -78,7 +209,7 @@ def plot_run(results, params, flags, z_convention="sim", save_dir=None):
     """
     Plot one simulation run.
 
-    Routes to :func:`_plot_2d` (≤5 cells) or :func:`_plot_3d` (>5 cells).
+    Routes to :func:`_plot_2d` (≤5 cells) or :func:`_plot_contour` (>5 cells).
 
     Parameters
     ----------
@@ -105,7 +236,7 @@ def plot_run(results, params, flags, z_convention="sim", save_dir=None):
     if n_cells <= 5:
         return _plot_2d(results, params, flags, z_pos, z_convention, save_dir)
     else:
-        return _plot_3d(results, params, flags, z_pos, z_convention, save_dir)
+        return _plot_contour(results, params, flags, z_pos, z_convention, save_dir)
 
 
 # ── 2-D plots (≤5 cells) ─────────────────────────────────────────────────────
@@ -254,14 +385,22 @@ def _plot_2d(results, params, flags, z_pos, z_convention, save_dir):
     _save(fig, "Qcx_power", save_dir)
 
     # ── Power balance ─────────────────────────────────────────────────────────
-    # Normalise each term (summed over cells) to input power.
-    Vd = params.get("Vd", 0)
-    Id = params.get("Id", 0)
-    input_power = Vd * Id
-    if flags.get("TwinCathode", False):
-        input_power += params.get("Twin_Vd", Vd) * params.get("Twin_Id", Id)
-    if input_power == 0:
-        input_power = 1.0  # avoid divide-by-zero for passive runs
+    # Normalise each term (summed over cells) to mean cathode input power during discharge.
+    tau_discharge_ms = params.get("tau_discharge", 20e-3) * 1e3
+    discharge_mask = (t > 1.0) & (t <= tau_discharge_ms)
+    cathode = results.get("cathode", {})
+    p_wall = cathode.get("P_wall") if isinstance(cathode, dict) else getattr(cathode, "P_wall", None)
+    if p_wall is not None and discharge_mask.any():
+        input_power = float(np.nanmean(p_wall[discharge_mask]))
+        if flags.get("TwinCathode", False):
+            cathode_twin = results.get("cathode_twin", {})
+            p_wall_twin = cathode_twin.get("P_wall") if isinstance(cathode_twin, dict) else getattr(cathode_twin, "P_wall", None)
+            if p_wall_twin is not None:
+                input_power += float(np.nanmean(p_wall_twin[discharge_mask]))
+    else:
+        input_power = 1.0
+    if input_power == 0 or not np.isfinite(input_power):
+        input_power = 1.0  # avoid divide-by-zero
 
     def _frac(key):
         total = np.abs(results[key]).sum(axis=1)
@@ -292,14 +431,14 @@ def _plot_2d(results, params, flags, z_pos, z_convention, save_dir):
     figs["ion_power_balance"] = fig
     _save(fig, "ion_power_balance", save_dir)
 
-    # ── Isat synthetic diagnostic (normalised to t=d_off) ────────────────────
+    # ── Isat synthetic diagnostic (normalised to t=tau_discharge) ────────────
     if "isat" in results:
         isat_raw = results["isat"]
         if isat_raw.ndim == 1:          # old run: only first cell was stored
             isat_raw = isat_raw[:, np.newaxis]
 
-        # Full-run plot: normalise to value at d_off
-        t_norm_ms = params.get("d_off", 20e-3) * 1e3  # d_off seconds → ms
+        # Full-run plot: normalise to value at end of main discharge (tau_discharge)
+        t_norm_ms = params.get("tau_discharge", 20e-3) * 1e3  # tau_discharge seconds → ms
         norm_idx = int(np.argmin(np.abs(t - t_norm_ms)))
         norm_vals = isat_raw[norm_idx, :]  # (n_cells,)
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -396,51 +535,64 @@ def _plot_2d(results, params, flags, z_pos, z_convention, save_dir):
     return figs
 
 
-# ── 3-D plots (>5 cells) ──────────────────────────────────────────────────────
+# ── Contour plots (>5 cells) ──────────────────────────────────────────────────
 
 
-def _plot_3d(results, params, flags, z_pos, z_convention, save_dir):
-    """3-D surface plots for >5 cells."""
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # registers 3D projection
-
+def _plot_contour(results, params, flags, z_pos, z_convention, save_dir):
+    """Position-vs-time contour plots for >5 cells."""
     t = results["time"]
     title_base = _run_title(params, flags)
     z_label = _z_axis_label(z_convention)
     figs = {}
 
-    T, Z = np.meshgrid(t, z_pos)  # both (n_cells, n_t)
+    Z_mesh, T_mesh = np.meshgrid(z_pos, t)  # both (n_t, n_cells)
+    _kw = dict(xlabel=z_label, ylabel="Time [ms]")
 
-    def _surf(key, label, title, log=False, scale=1.0):
-        vals = results[key].T * scale  # (n_cells, n_t)
-        if log:
-            vals = np.where(vals > 0, np.log10(vals), np.nan)
-            label = f"log₁₀({label})"
+    # ── Densities (ne, nn, ionization fraction) ────────────────────────────────
+    ne = np.where(results["ne"] > 0, results["ne"], np.nan)
+    nn_arr = np.where(results["nn"] > 0, results["nn"], np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where((ne > 0) & (nn_arr > 0), ne / nn_arr, np.nan)
 
-        fig = plt.figure(figsize=(10, 6), constrained_layout=True)
-        ax = fig.add_subplot(111, projection="3d")
-        surf = ax.plot_surface(T, Z, vals, cmap="viridis", linewidth=0, antialiased=True)
-        ax.set_xlabel("Time [ms]")
-        ax.set_ylabel(z_label)
-        ax.set_zlabel(label)
-        ax.set_title(f"{title}\n{title_base}", fontsize=10)
-        fig.colorbar(surf, ax=ax, shrink=0.5, label=label)
-        return fig
+    ne_log = np.where(ne > 0, np.log10(ne), np.nan)
+    nn_log = np.where(nn_arr > 0, np.log10(nn_arr), np.nan)
+    ratio_log = np.where(ratio > 0, np.log10(ratio), np.nan)
 
-    figs["ne_3d"] = _surf("ne", r"$n_e$ [cm⁻³]", "Electron Density", log=True)
-    _save(figs["ne_3d"], "ne_3d", save_dir)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
+    _contour_panel(axes[0], fig, Z_mesh, T_mesh, ne_log,
+                   "Electron Density", r"$n_e$ [cm$^{-3}$]", is_log=True, **_kw)
+    _contour_panel(axes[1], fig, Z_mesh, T_mesh, nn_log,
+                   "Neutral Density", r"$n_n$ [cm$^{-3}$]", is_log=True, **_kw)
+    _contour_panel(axes[2], fig, Z_mesh, T_mesh, ratio_log,
+                   r"Ionisation Fraction $n_e/n_n$", r"$n_e/n_n$",
+                   is_log=True, is_ratio=True, vmin=-2, vmax=2, **_kw)
+    fig.suptitle(f"Densities\n{title_base}", fontsize=10)
+    figs["densities"] = fig
+    _save(fig, "densities", save_dir)
 
-    figs["nn_3d"] = _surf("nn", r"$n_n$ [cm⁻³]", "Neutral Density", log=True)
-    _save(figs["nn_3d"], "nn_3d", save_dir)
+    # ── Temperatures (Te, Ti) ──────────────────────────────────────────────────
+    Te = np.where(np.isfinite(results["Te"]), results["Te"], np.nan)
+    Ti = np.where(np.isfinite(results["Ti"]), results["Ti"], np.nan)
 
-    figs["Te_3d"] = _surf("Te", r"$T_e$ [eV]", "Electron Temperature")
-    _save(figs["Te_3d"], "Te_3d", save_dir)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
+    _contour_panel(axes[0], fig, Z_mesh, T_mesh, Te,
+                   "Electron Temperature", r"$T_e$ [eV]", is_log=False, **_kw)
+    _contour_panel(axes[1], fig, Z_mesh, T_mesh, Ti,
+                   "Ion Temperature", r"$T_i$ [eV]", is_log=False, **_kw)
+    fig.suptitle(f"Temperatures\n{title_base}", fontsize=10)
+    figs["temperatures"] = fig
+    _save(fig, "temperatures", save_dir)
 
-    figs["Ti_3d"] = _surf("Ti", r"$T_i$ [eV]", "Ion Temperature")
-    _save(figs["Ti_3d"], "Ti_3d", save_dir)
-
+    # ── Parallel velocity ──────────────────────────────────────────────────────
     if "v_plasma" in results:
-        figs["v_plasma_3d"] = _surf("v_plasma", r"$v_\parallel$ [m/s]", "Parallel Velocity", scale=1/100.0)
-        _save(figs["v_plasma_3d"], "v_plasma_3d", save_dir)
+        v = np.where(np.isfinite(results["v_plasma"]),
+                     results["v_plasma"] / 100.0, np.nan)  # cm/s → m/s
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4), constrained_layout=True)
+        _contour_panel(ax, fig, Z_mesh, T_mesh, v,
+                       "Parallel Velocity", r"$v_\parallel$ [m/s]", is_log=False, **_kw)
+        fig.suptitle(f"Parallel Velocity\n{title_base}", fontsize=10)
+        figs["v_plasma"] = fig
+        _save(fig, "v_plasma", save_dir)
 
     return figs
 
@@ -695,16 +847,15 @@ def plot_run_comparison(db_path, run_ids, quantity, cell_idx=-1):
                 continue
 
             gas = params.get("gas_type", "?")
-            Vd = params.get("Vd", 0)
-            Id = params.get("Id", 0)
+            V_bank = params.get("V_bank", 0)
+            T_s_K = params.get("T_s", 0)
+            T_s_C = T_s_K - 273.15 if T_s_K else 0
             twin_active = flags.get("TwinCathode", False)
-            Twin_Id = params.get("Twin_Id", 0.0) if twin_active else 0.0
             S_gp = params.get("S_gp", 0.0)
             Twin_S_gp = params.get("Twin_S_gp", 0.0) if twin_active else 0.0
-            P_total_MW = (Id + Twin_Id) * Vd / 1e6
             S_gp_total = S_gp + Twin_S_gp
             twin_str = "twin" if twin_active else "single"
-            run_label = f"{run_id}  {gas}  P={P_total_MW:.2f}MW  S_gp={S_gp_total:.0f}  [{twin_str}]"
+            run_label = f"{run_id}  {gas}  V_bank={V_bank:.0f}V  T_s={T_s_C:.0f}°C  S_gp={S_gp_total:.0f}  [{twin_str}]"
             run_labels.append((run_i, run_label))
 
             ls = _RUN_LINESTYLES[run_i % len(_RUN_LINESTYLES)]
