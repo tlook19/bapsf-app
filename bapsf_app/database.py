@@ -64,6 +64,61 @@ def _str_dtype():
     return h5py.string_dtype(encoding="utf-8")
 
 
+def _is_string_dataset(ds) -> bool:
+    """Return True for HDF5 fixed/vlen string datasets."""
+    return h5py.check_string_dtype(ds.dtype) is not None or ds.dtype.kind in ("S", "U")
+
+
+def _stringify_index_value(val) -> str:
+    """Convert an index value to a stable string representation."""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    if isinstance(val, np.generic):
+        val = val.item()
+    if isinstance(val, float) and np.isnan(val):
+        return ""
+    return str(val)
+
+
+def _coerce_index_value(val):
+    """Return the scalar value and HDF5 dtype to use for a new index dataset."""
+    if isinstance(val, (bool, np.bool_)):
+        return np.int8(val), "i1"
+    if isinstance(val, (int, np.integer)):
+        return np.int32(val), "i4"
+    if isinstance(val, str):
+        return val, _str_dtype()
+    return np.float64(val), "f8"
+
+
+def _promote_dataset_to_strings(grp, key):
+    """Replace an existing numeric index dataset with an equivalent string one."""
+    old = grp[key][:]
+    old_values = [_stringify_index_value(v) for v in old]
+    del grp[key]
+    grp.create_dataset(
+        key,
+        data=np.array(old_values, dtype=object),
+        maxshape=(None,),
+        dtype=_str_dtype(),
+    )
+    return grp[key]
+
+
+def _pad_array(arr, n_rows: int, pad_value):
+    """Return an array/list padded or trimmed to match the index row count."""
+    if isinstance(arr, list):
+        values = arr[:n_rows]
+        values.extend([pad_value] * (n_rows - len(values)))
+        return values
+
+    arr = np.asarray(arr)
+    if len(arr) >= n_rows:
+        return arr[:n_rows]
+    pad = np.full(n_rows - len(arr), pad_value, dtype=arr.dtype)
+    return np.concatenate([arr, pad])
+
+
 def _append_dataset(grp, key, val):
     """
     Append a single value to a resizable dataset in `grp`, creating it if needed.
@@ -72,18 +127,7 @@ def _append_dataset(grp, key, val):
     Booleans are stored as int8.
     Floats and ints are stored as float64 and int32 respectively.
     """
-    if isinstance(val, bool):
-        np_val = np.int8(val)
-        dtype = "i1"
-    elif isinstance(val, (int, np.integer)):
-        np_val = np.int32(val)
-        dtype = "i4"
-    elif isinstance(val, str):
-        np_val = val
-        dtype = _str_dtype()
-    else:
-        np_val = np.float64(val)
-        dtype = "f8"
+    np_val, dtype = _coerce_index_value(val)
 
     if key not in grp:
         if isinstance(np_val, str):
@@ -102,12 +146,26 @@ def _append_dataset(grp, key, val):
             )
     else:
         ds = grp[key]
+        if _is_string_dataset(ds):
+            np_val = _stringify_index_value(val)
+        elif isinstance(np_val, str):
+            ds = _promote_dataset_to_strings(grp, key)
+            np_val = _stringify_index_value(val)
         n = ds.shape[0]
         ds.resize((n + 1,))
         ds[n] = np_val
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
+def _create_result_dataset(grp, key, val):
+    """Create a result dataset, compressing arrays but not HDF5 scalars."""
+    arr = np.asarray(val)
+    if arr.shape == ():
+        grp.create_dataset(key, data=arr)
+    else:
+        grp.create_dataset(key, data=arr, compression="gzip", compression_opts=4)
+
 
 def save_run(db, run_id, params, flags, results, stats):
     """
@@ -156,14 +214,13 @@ def save_run(db, run_id, params, flags, results, stats):
             cgrp = grp.create_group(key)
             field_items = vars(val).items() if not isinstance(val, dict) else val.items()
             for fname, farr in field_items:
-                cgrp.create_dataset(fname, data=np.asarray(farr), compression="gzip", compression_opts=4)
+                _create_result_dataset(cgrp, fname, farr)
         elif key == "refinement_events":
             # list of (t, old_cells, new_cells) tuples — convert to uniform (N, 3) float array
             arr = np.array(val, dtype=float).reshape(-1, 3) if val else np.zeros((0, 3), dtype=float)
             grp.create_dataset(key, data=arr, compression="gzip", compression_opts=4)
         else:
-            arr = np.asarray(val)
-            grp.create_dataset(key, data=arr, compression="gzip", compression_opts=4)
+            _create_result_dataset(grp, key, val)
 
     # Store pre-computed stats as attrs on a subgroup
     sg = grp.create_group("stats_10_20ms")
@@ -206,9 +263,12 @@ def load_run(db, run_id, keys=None):
         if k in grp:
             item = grp[k]
             if isinstance(item, h5py.Group):
-                results[k] = {fname: item[fname][:] for fname in item.keys()}
+                results[k] = {
+                    fname: item[fname][()] if item[fname].shape == () else item[fname][:]
+                    for fname in item.keys()
+                }
             else:
-                results[k] = item[:]
+                results[k] = item[()] if item.shape == () else item[:]
 
     return params, flags, results
 
@@ -271,8 +331,13 @@ def update_index(db, run_id, params, flags, stats, n_cells, status="ok"):
         _append_dataset(p_grp, k, val)
 
     f_grp = idx.require_group("flags")
-    for k, v in flags.items():
-        _append_dataset(f_grp, k, int(bool(v)))
+    all_flag_keys = set(f_grp.keys()) | set(flags.keys())
+    for k in all_flag_keys:
+        val = int(bool(flags[k])) if k in flags else 0
+        current_len = f_grp[k].shape[0] if k in f_grp else 0
+        for _ in range(n_rows - 1 - current_len):
+            _append_dataset(f_grp, k, 0)
+        _append_dataset(f_grp, k, val)
 
     s_grp = idx.require_group("stats_10_20ms")
     # n_rows = total runs including this one (run_ids was already appended above)
@@ -328,10 +393,13 @@ def load_index(db):
     def _decode(arr):
         return [s.decode() if isinstance(s, bytes) else s for s in arr]
 
+    run_ids = _decode(idx["run_ids"][:])
+    n_rows = len(run_ids)
+
     result = {
-        "run_ids": _decode(idx["run_ids"][:]),
-        "status": _decode(idx["status"][:]),
-        "n_cells": idx["n_cells"][:].astype(int),
+        "run_ids": run_ids,
+        "status": _pad_array(_decode(idx["status"][:]), n_rows, "unknown"),
+        "n_cells": _pad_array(idx["n_cells"][:], n_rows, 0).astype(int),
         "params": {},
         "flags": {},
         "stats_10_20ms": {},
@@ -339,13 +407,16 @@ def load_index(db):
 
     for k in idx.get("params", {}).keys():
         ds = idx["params"][k][:]
-        result["params"][k] = _decode(ds) if ds.dtype.kind in ("O", "S", "U") else ds
+        if _is_string_dataset(idx["params"][k]):
+            result["params"][k] = _pad_array(_decode(ds), n_rows, "")
+        else:
+            result["params"][k] = _pad_array(ds, n_rows, float("nan"))
 
     for k in idx.get("flags", {}).keys():
-        result["flags"][k] = idx["flags"][k][:].astype(bool)
+        result["flags"][k] = _pad_array(idx["flags"][k][:], n_rows, 0).astype(bool)
 
     for k in idx.get("stats_10_20ms", {}).keys():
-        result["stats_10_20ms"][k] = idx["stats_10_20ms"][k][:]
+        result["stats_10_20ms"][k] = _pad_array(idx["stats_10_20ms"][k][:], n_rows, float("nan"))
 
     return result
 

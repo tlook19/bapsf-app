@@ -19,11 +19,13 @@ Usage
 import itertools
 import multiprocessing
 import os
+import pathlib
 import queue as _stdlib_queue
 import tempfile
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 
@@ -466,6 +468,21 @@ _WORKER_PROGRESS_Q = None   # set in each worker by _worker_init; never pickled 
 _WORKER_LOG_FILE = None     # holds open file ref so GC doesn't close it prematurely
 
 
+def _diagnostic_log_dir(db_path):
+    """Return the per-database directory for sweep and worker diagnostics."""
+    db_p = pathlib.Path(db_path).expanduser()
+    log_dir = db_p.parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
+def _new_log_prefix(db_path):
+    """Create a readable, per-sweep log filename prefix."""
+    db_p = pathlib.Path(db_path).expanduser()
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return f"{db_p.stem}.{stamp}_{time.time_ns() % 1_000_000_000:09d}"
+
+
 def _set_worker_thread_limits():
     """
     Keep native math libraries from oversubscribing CPU cores in each worker.
@@ -491,7 +508,7 @@ def _set_worker_thread_limits():
         os.environ["XDG_CACHE_HOME"] = xdg_cache_dir
 
 
-def _worker_init(progress_q, db_path=None):
+def _worker_init(progress_q, db_path=None, log_dir=None, log_prefix=None):
     """
     Called once per worker process at spawn time.
     Stores the progress queue in a module-level global (avoids pickling it per task),
@@ -505,7 +522,7 @@ def _worker_init(progress_q, db_path=None):
     _WORKER_PROGRESS_Q = progress_q
     _set_worker_thread_limits()
 
-    import sys as _sys, pathlib, time as _time
+    import sys as _sys, time as _time
 
     # Workers inherit the parent process's nice value.  When the app is launched
     # from a low-priority shell (e.g. `conda run ... &` from a VSCode terminal)
@@ -553,30 +570,41 @@ def _worker_init(progress_q, db_path=None):
 
     if db_path is not None:
         db_p = pathlib.Path(db_path).expanduser()
-        log_path = db_p.parent / f"{db_p.stem}.worker_{os.getpid()}.log"
+        log_base = pathlib.Path(log_dir).expanduser() if log_dir else _diagnostic_log_dir(db_p)
+        log_base.mkdir(parents=True, exist_ok=True)
+        prefix = log_prefix or db_p.stem
+        log_path = log_base / f"{prefix}.worker_{os.getpid()}.log"
     else:
         import tempfile as _tempfile
         log_path = pathlib.Path(_tempfile.gettempdir()) / f"lapd_worker_{os.getpid()}.log"
 
     # line-buffered so output appears in the file immediately after each newline
-    log_file = open(log_path, "w", buffering=1)
+    try:
+        log_file = open(log_path, "w", buffering=1, encoding="utf-8")
+    except PermissionError:
+        import tempfile as _tempfile
+        fallback_dir = pathlib.Path(_tempfile.gettempdir()) / "bapsf_app_worker_logs"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        log_path = fallback_dir / f"{prefix}.worker_{os.getpid()}.log"
+        log_file = open(log_path, "w", buffering=1, encoding="utf-8")
     log_file.write(
         f"# bapsf worker pid={os.getpid()} started {_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"# db={db_path}\n"
         f"# log={log_path}\n"
-        f"# nice: {_nice_before} → {_nice_after}  qos_promoted={_qos_promoted}\n\n"
+        f"# nice: {_nice_before} -> {_nice_after}  qos_promoted={_qos_promoted}\n\n"
     )
     log_file.flush()
 
     # Redirect OS-level fd 1/2 so that C-level printf in native extensions also goes
     # to the log file rather than the parent's pipe (which would block once full on
     # POSIX).  Wrapped in try/except because Windows dup2 semantics differ slightly.
-    try:
-        log_fd = log_file.fileno()
-        os.dup2(log_fd, 1)
-        os.dup2(log_fd, 2)
-    except Exception:
-        pass
+    if _sys.platform != "win32":
+        try:
+            log_fd = log_file.fileno()
+            os.dup2(log_fd, 1)
+            os.dup2(log_fd, 2)
+        except Exception:
+            pass
     _sys.stdout = log_file
     _sys.stderr = log_file
     _WORKER_LOG_FILE = log_file  # keep alive; sys.stdout ref alone is enough but belt-and-suspenders
@@ -934,19 +962,21 @@ def grid_sweep_parallel(
     # Queue is passed to workers via initargs (pickled once during spawn, not per task).
     # Task args contain only plain Python objects to avoid _CallItem serialization errors.
     progress_mp_q = multiprocessing.Queue()
+    parallel_start_count = completed_count
 
-    import pathlib, logging
-    _log_path = pathlib.Path(db_path).expanduser().with_suffix(".sweep.log")
-    _sweep_log = logging.getLogger("bapsf_app.sweep")
-    if not _sweep_log.handlers:
-        _fh = logging.FileHandler(str(_log_path))
-        _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        _sweep_log.addHandler(_fh)
-        _sweep_log.propagate = False
+    import logging
+    _log_dir = _diagnostic_log_dir(db_path)
+    _log_prefix = _new_log_prefix(db_path)
+    _log_path = _log_dir / f"{_log_prefix}.sweep.log"
+    _sweep_log = logging.getLogger(f"bapsf_app.sweep.{_log_prefix}")
+    _fh = logging.FileHandler(str(_log_path), mode="w")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _sweep_log.addHandler(_fh)
+    _sweep_log.propagate = False
     _sweep_log.setLevel(logging.INFO)
     _sweep_log.info(
         f"sweep start: {n_total} runs, {n_workers} workers, db={db_path}  "
-        f"worker logs: {pathlib.Path(db_path).expanduser().parent / '*.worker_<pid>.log'}"
+        f"worker logs: {_log_dir / (_log_prefix + '.worker_<pid>.log')}"
     )
 
     _set_worker_thread_limits()
@@ -954,12 +984,13 @@ def grid_sweep_parallel(
     with ProcessPoolExecutor(
         max_workers=n_workers,
         initializer=_worker_init,
-        initargs=(progress_mp_q, db_path),
+        initargs=(progress_mp_q, db_path, str(_log_dir), _log_prefix),
     ) as executor:
         future_to_run = {}
         for (run_id, params, flags), equil_info in zip(pending, pending_equil_info):
             fut = executor.submit(_run_single_worker, (run_id, params, flags))
             future_to_run[fut] = (run_id, params, flags, equil_info)
+        completed_run_ids = set()
 
         def _drain_progress_q():
             # Drain at most ~200 messages per call with a short timeout so this
@@ -968,6 +999,8 @@ def grid_sweep_parallel(
             for _ in range(200):
                 try:
                     msg = progress_mp_q.get(block=True, timeout=0.002)
+                    if msg.get("run_id") in completed_run_ids:
+                        continue
                     if progress_callback is not None:
                         msg_type = msg.get("type", "progress")
                         if msg_type == "starting":
@@ -984,9 +1017,20 @@ def grid_sweep_parallel(
         def _handle_future(future):
             nonlocal completed_count
             run_id, params, flags, equil_info = future_to_run[future]
-            completed_count += 1
             try:
                 _, _, _, results, run_time = future.result()
+            except BrokenProcessPool:
+                msg = (
+                    "Process pool terminated abruptly. Leaving remaining runs "
+                    "unrecorded so the sweep can be resumed after reducing workers "
+                    "or fixing the worker crash."
+                )
+                _sweep_log.error(f"{run_id} pool broken: {msg}")
+                return False
+
+            completed_count += 1
+            completed_run_ids.add(run_id)
+            try:
                 stats = compute_window_stats(results, t_window)
                 cat = getattr(results, "cells_at_time", None)
                 n_cells = int(cat.max()) if cat is not None and len(cat) > 0 else int(params.get("cells", 3))
@@ -1051,15 +1095,27 @@ def grid_sweep_parallel(
                         "_TwinCathode": bool(flags.get("TwinCathode", False)),
                         "_error": tb.strip().splitlines()[-1],
                     })
+            return True
 
         # Poll for completions and drain progress queue every 0.1s
         pending_futs = set(future_to_run.keys())
         should_stop = False
+        pool_error = None
         while pending_futs and not should_stop:
             done_futs, pending_futs = wait(pending_futs, timeout=0.1, return_when=FIRST_COMPLETED)
             _drain_progress_q()
             for future in done_futs:
-                _handle_future(future)
+                handled = _handle_future(future)
+                if not handled:
+                    for remaining in pending_futs:
+                        remaining.cancel()
+                    pool_error = (
+                        "Worker process pool terminated abruptly. Remaining runs "
+                        "were left pending; resume the sweep after lowering the "
+                        "worker count or checking worker logs."
+                    )
+                    should_stop = True
+                    break
                 if stop_event is not None and stop_event.is_set():
                     for remaining in pending_futs:
                         remaining.cancel()
@@ -1071,5 +1127,35 @@ def grid_sweep_parallel(
 
     if verbose:
         print(f"Parallel sweep complete: {len(successful)}/{n_total} runs succeeded.")
+
+    _sweep_log.removeHandler(_fh)
+    _fh.close()
+
+    if pool_error and completed_count == parallel_start_count:
+        _sweep_log.warning(
+            "Parallel worker pool failed before any new run completed; "
+            "falling back to in-process serial execution."
+        )
+        _sweep_log.removeHandler(_fh)
+        _fh.close()
+        return grid_sweep_parallel(
+            param_ranges=param_ranges,
+            flag_ranges=flag_ranges,
+            fixed_params=fixed_params,
+            fixed_flags=fixed_flags,
+            db_path=db_path,
+            t_window=t_window,
+            n_workers=1,
+            progress_callback=progress_callback,
+            param_aliases=param_aliases,
+            param_transforms=param_transforms,
+            equilibrate_nn=equilibrate_nn,
+            verbose=verbose,
+            verbose_equil=verbose_equil,
+            stop_event=stop_event,
+        )
+
+    if pool_error:
+        raise RuntimeError(pool_error)
 
     return successful
