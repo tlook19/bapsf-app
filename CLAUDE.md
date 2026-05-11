@@ -8,18 +8,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-```bash
+This repository is currently being developed on a Windows PC as part of the
+workspace at `D:\bapsf`.  Use the `bapsf-app` mamba environment when working
+locally.  The environment may still need to be updated to match the Python and
+package constraints in `pyproject.toml`.
+
+```powershell
 # Activate environment
-conda activate fenicsx-env
+mamba activate bapsf-app
+# or, if this environment is managed through conda:
+conda activate bapsf-app
+
+# Confirm the Python version satisfies pyproject.toml
+python --version
 
 # Install dependencies (requires cablp sibling package at ../bapsf-transport/cablp)
+cd D:\bapsf\bapsf-app
 poetry install
 
 # Run the app
 poetry run lapd-app
 # or directly:
-streamlit run bapsf_app/app.py
+python -m streamlit run bapsf_app/app.py
 ```
+
+If `mamba`/`conda` is not visible in the active shell, do not assume the
+environment is missing.  On Windows, PowerShell may simply not have been
+initialized for conda/mamba; use an initialized shell or the full path to the
+`bapsf-app` environment's Python executable.
+
+`pyproject.toml` currently requires Python `>=3.14`.  The app also depends on
+the sibling editable `cablp` package at `../bapsf-transport/cablp`.
 
 No test suite or linter is currently configured.
 

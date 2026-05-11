@@ -33,6 +33,9 @@ import streamlit as st
 
 matplotlib.use("Agg")  # non-interactive backend required for Streamlit
 
+_WORKSPACE_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_DEFAULT_DB_PATH = _WORKSPACE_ROOT / "database" / "sweep.h5"
+
 # Absolute imports (relative imports fail when Streamlit runs app.py as __main__)
 from bapsf_app.sweep import grid_sweep_parallel, param_combinations
 from bapsf_app.database import open_db, load_index, list_runs, load_run, rebuild_index, update_index
@@ -49,6 +52,11 @@ def _manifest_path(db_path: str) -> pathlib.Path:
     """Return the JSON manifest path for a given database path."""
     p = pathlib.Path(db_path).expanduser()
     return p.parent / (p.stem + ".progress.json")
+
+
+def _log_dir(db_path: str) -> pathlib.Path:
+    """Return the diagnostic log directory for a database path."""
+    return pathlib.Path(db_path).expanduser().parent / "logs"
 
 
 def _save_manifest(db_path: str, data: dict) -> None:
@@ -101,6 +109,7 @@ def _render_path_input(key: str, label: str, default: str, file_ext: str = ".h5"
         # Start browse from parent dir of current path, or best fallback
         candidates = [
             cur.parent if (cur.suffix == file_ext or cur.is_file()) else cur,
+            _DEFAULT_DB_PATH.parent,
             pathlib.Path("~/lapd_data").expanduser(),
             pathlib.Path.home(),
         ]
@@ -498,6 +507,7 @@ class SweepState:
     db_path: str = ""
     planned_run_ids: list = field(default_factory=list)
     active_runs: dict = field(default_factory=dict)   # run_id -> {start_time, label}
+    finished_run_ids: set = field(default_factory=set)
     completed_run_times: list = field(default_factory=list)
 
 
@@ -515,6 +525,43 @@ def _set_ss(key, value):
 
 
 # ── Range computation ─────────────────────────────────────────────────────────
+
+def _process_tree_metrics():
+    """Return RAM and CPU for the Streamlit process plus live worker children."""
+    parent = psutil.Process()
+    try:
+        procs = [parent, *parent.children(recursive=True)]
+    except psutil.Error:
+        procs = [parent]
+
+    ram_gb = 0.0
+    now = time.time()
+    last = st.session_state.get("_proc_tree_cpu_sample")
+    current_times = {}
+
+    for proc in procs:
+        try:
+            times = proc.cpu_times()
+            current_times[proc.pid] = times.user + times.system
+            ram_gb += proc.memory_info().rss / 1e9
+        except psutil.Error:
+            continue
+
+    cpu_pct = 0.0
+    if last is not None:
+        last_wall, last_times = last
+        wall_dt = max(now - last_wall, 1e-6)
+        cpu_dt = sum(
+            max(total_time - last_times[pid], 0.0)
+            for pid, total_time in current_times.items()
+            if pid in last_times
+        )
+        n_cpu = max(psutil.cpu_count(logical=True) or 1, 1)
+        cpu_pct = min(100.0, 100.0 * cpu_dt / (wall_dt * n_cpu))
+
+    st.session_state["_proc_tree_cpu_sample"] = (now, current_times)
+    return ram_gb, cpu_pct, max(len(current_times) - 1, 0)
+
 
 def _arange_inclusive(min_val, max_val, step):
     """np.arange with inclusive upper bound."""
@@ -541,6 +588,21 @@ def _format_vals(vals):
 
 # ── Widget renderers ───────────────────────────────────────────────────────────
 
+def _widget_value(key: str, default):
+    """Avoid Streamlit's warning when restored session state owns a widget value."""
+    return None if key in st.session_state else default
+
+
+def _widget_index(key: str, default: int) -> int | None:
+    """Avoid mixing widget index defaults with values restored into session state."""
+    return None if key in st.session_state else default
+
+
+def _widget_default(key: str, default):
+    """Avoid mixing multiselect defaults with values restored into session state."""
+    return None if key in st.session_state else default
+
+
 def _num_format(value) -> str:
     """Return a printf format string for a number input.
 
@@ -566,39 +628,63 @@ def _render_param_row(key: str, meta: dict) -> None:
 
     if param_type == "str":
         choices = meta.get("choices", [])
+        mode_key = f"pmode_{key}"
         mode = st.radio(
             f"##mode_{key}", ["Fixed", "Vary"], horizontal=True,
-            label_visibility="collapsed", key=f"pmode_{key}",
+            index=_widget_index(mode_key, 0),
+            label_visibility="collapsed", key=mode_key,
         )
         if mode == "Fixed":
             idx_default = choices.index(default) if default in choices else 0
-            val = st.selectbox(f"##fix_{key}", choices, index=idx_default,
-                               label_visibility="collapsed", key=f"pfixed_{key}")
+            fixed_key = f"pfixed_{key}"
+            val = st.selectbox(
+                f"##fix_{key}", choices,
+                index=_widget_index(fixed_key, idx_default),
+                label_visibility="collapsed", key=fixed_key,
+            )
             _set_ss(f"param_{key}", {"mode": "fixed", "value": val})
         else:
-            selected = st.multiselect(f"##vary_{key}", choices, default=choices,
-                                      label_visibility="collapsed", key=f"pvary_{key}")
+            vary_key = f"pvary_{key}"
+            selected = st.multiselect(
+                f"##vary_{key}", choices,
+                default=_widget_default(vary_key, choices),
+                label_visibility="collapsed", key=vary_key,
+            )
             _set_ss(f"param_{key}", {"mode": "range", "values": selected or choices})
         return
 
     # Numeric (float / int)
+    mode_key = f"pmode_{key}"
     mode = st.radio(
         f"##mode_{key}", ["Fixed", "Range"], horizontal=True,
-        label_visibility="collapsed", key=f"pmode_{key}",
+        index=_widget_index(mode_key, 0),
+        label_visibility="collapsed", key=mode_key,
     )
     fmt = _num_format(default)
     if mode == "Fixed":
+        fixed_key = f"pfixed_{key}"
         val = st.number_input(
-            f"##fix_{key}", value=float(default), format=fmt,
-            label_visibility="collapsed", key=f"pfixed_{key}",
+            f"##fix_{key}", value=_widget_value(fixed_key, float(default)),
+            format=fmt, label_visibility="collapsed", key=fixed_key,
         )
         _set_ss(f"param_{key}", {"mode": "fixed", "value": val})
     else:
         c1, c2, c3 = st.columns(3)
-        min_v = c1.number_input("Min", value=float(default), format=fmt, key=f"pmin_{key}")
-        max_v = c2.number_input("Max", value=float(default) * 2, format=fmt, key=f"pmax_{key}")
-        step_v = c3.number_input("Step", value=abs(float(default)) or 1.0, format=fmt,
-                                 key=f"pstep_{key}", min_value=1e-30)
+        min_key = f"pmin_{key}"
+        max_key = f"pmax_{key}"
+        step_key = f"pstep_{key}"
+        min_v = c1.number_input(
+            "Min", value=_widget_value(min_key, float(default)),
+            format=fmt, key=min_key,
+        )
+        max_v = c2.number_input(
+            "Max", value=_widget_value(max_key, float(default) * 2),
+            format=fmt, key=max_key,
+        )
+        step_v = c3.number_input(
+            "Step", value=_widget_value(step_key, abs(float(default)) or 1.0),
+            format=fmt, key=step_key, min_value=1e-30,
+        )
         vals = _arange_inclusive(min_v, max_v, step_v)
         if param_type == "int":
             vals = np.unique(vals.astype(int))
@@ -612,9 +698,11 @@ def _render_flag_row(key: str, meta: dict) -> None:
     label = meta["label"]
     default = meta["default"]
     default_sel = "True" if default else "False"
+    flag_key = f"flag_{key}"
     choice = st.radio(
-        label, ["False", "True", "Both"], index=["False", "True", "Both"].index(default_sel),
-        horizontal=True, key=f"flag_{key}",
+        label, ["False", "True", "Both"],
+        index=_widget_index(flag_key, ["False", "True", "Both"].index(default_sel)),
+        horizontal=True, key=flag_key,
     )
     _set_ss(f"flagcfg_{key}", choice)
 
@@ -764,6 +852,7 @@ def _drain_queue():
         if "done" in msg:
             state.running = False
             state.done = True
+            state.active_runs.clear()
             state.total_time_s = msg.get("total_time_s", 0.0)
             st.session_state["sweep_running"] = False
             if state.db_path:
@@ -780,6 +869,7 @@ def _drain_queue():
             state.error = msg["error"]
             state.running = False
             state.done = True
+            state.active_runs.clear()
             st.session_state["sweep_running"] = False
             if state.db_path:
                 _save_manifest(state.db_path, {
@@ -797,6 +887,9 @@ def _drain_queue():
             run_id = msg.get("run_id", "")
             status = msg.get("status", "ok")
             stats = msg.get("stats", {})
+
+            if run_id in state.finished_run_ids and status in {"starting", "progress"}:
+                continue
 
             if status == "starting":
                 start_time = stats.get("_start_time", time.time())
@@ -837,6 +930,7 @@ def _drain_queue():
                     info["rate_ema"] = stats.get("rate_ema", info["rate_ema"])
             else:
                 state.completed = msg.get("i", state.completed)
+                state.finished_run_ids.add(run_id)
                 state.active_runs.pop(run_id, None)
                 if status == "failed":
                     state.failed += 1
@@ -950,6 +1044,7 @@ def _start_sweep_thread(db_path, n_workers, t_window, param_ranges, flag_ranges,
     st.session_state["sweep_state"] = state
     st.session_state["sweep_running"] = True
     st.session_state["sweep_stop_event"] = stop_event
+    st.session_state["_sweep_final_app_rerun_done"] = False
     thread.start()
 
 
@@ -980,6 +1075,81 @@ def _index_to_df(idx):
 
 
 # ── Tab renderers ─────────────────────────────────────────────────────────────
+
+@st.fragment(run_every=1.0)
+def _render_sweep_progress():
+    """Render the live sweep status without repainting the whole app."""
+    if "sweep_state" not in st.session_state:
+        return
+
+    _drain_queue()
+    state: SweepState = st.session_state["sweep_state"]
+
+    st.divider()
+
+    _PHASE_NAMES = {0.0: "pre-breakdown", 1.0: "main discharge", 2.0: "afterglow"}
+    now = time.time()
+    if state.active_runs:
+        st.caption(f"Active runs ({len(state.active_runs)})")
+        for rid, info in state.active_runs.items():
+            elapsed = now - info["start_time"]
+            frac = info["frac"]
+            phase_str = _PHASE_NAMES.get(info["phase_code"], "pre-breakdown")
+            seg_wall = info["seg_wall"]
+            rate_ema = info["rate_ema"]
+            seg_str = f"  last 1ms: {seg_wall:.2f}s" if seg_wall > 0 else ""
+            if rate_ema > 0 and frac > 0:
+                remaining_ms = (1.0 - frac) * info["t_total_ms"]
+                eta_s = remaining_ms * rate_ema
+                m, s = divmod(int(eta_s), 60)
+                eta_str = f"  ETA {m}m{s:02d}s" if m else f"  ETA {s}s"
+            else:
+                eta_str = ""
+            text = f"{rid}  {info['label']}  [{phase_str}]  {elapsed:.0f}s elapsed  {frac*100:.0f}%{seg_str}{eta_str}"
+            st.progress(frac, text=text)
+            if seg_wall > 30:
+                _db_dir = _log_dir(state.db_path) if state.db_path else pathlib.Path("~").expanduser()
+                _db_stem = pathlib.Path(state.db_path).stem if state.db_path else "sweep"
+                st.warning(
+                    f"{rid}: very slow - {seg_wall:.0f}s per 1ms of sim time. "
+                    f"Check worker logs for step size (h= lines): "
+                    f"`{_db_dir}/{_db_stem}.*.worker_*.log`  "
+                    "Possible causes: CFL-forced tiny steps, or resource contention."
+                )
+
+    progress_frac = state.completed / max(state.total, 1)
+    st.progress(
+        progress_frac,
+        text=f"{state.completed}/{state.total} runs complete"
+        + (f"  ({state.failed} failed)" if state.failed else ""),
+    )
+
+    proc_ram, cpu_pct, worker_count = _process_tree_metrics()
+    sys_vm = psutil.virtual_memory()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("App + workers RAM", f"{proc_ram:.2f} GB")
+    m2.metric("System available", f"{sys_vm.available / 1e9:.2f} GB")
+    m3.metric("System RAM used", f"{sys_vm.percent:.0f}%")
+    m4.metric("App + workers CPU", f"{cpu_pct:.0f}%", help=f"{worker_count} worker process(es)")
+
+    log_text = "\n".join(state.log[-30:]) if state.log else "(waiting for first run...)"
+    st.text_area("Completed runs (last 30)", log_text, height=200)
+
+    if state.done:
+        time_str = f"  Total: {state.total_time_s:.1f}s" if state.total_time_s > 0 else ""
+        if state.error:
+            st.error(f"Sweep failed: {state.error}")
+        elif state.failed == 0:
+            st.success(f"Sweep complete: {state.completed}/{state.total} runs succeeded.{time_str}")
+        else:
+            st.warning(
+                f"Sweep done: {state.completed - state.failed} succeeded, "
+                f"{state.failed} failed.{time_str}"
+            )
+        if not st.session_state.get("_sweep_final_app_rerun_done", False):
+            st.session_state["_sweep_final_app_rerun_done"] = True
+            st.rerun()
+
 
 def _render_configure_tab():
     st.header("Configure Parameter Sweep")
@@ -1018,6 +1188,7 @@ def _render_configure_tab():
                 "Dual Cathode",
                 ["Off", "On", "Both"],
                 horizontal=True,
+                index=_widget_index("dc_on_off", 0),
                 key="dc_on_off",
                 help=(
                     "**Off**: single cathode only.  "
@@ -1030,6 +1201,7 @@ def _render_configure_tab():
                     "Second cathode type",
                     ["Twin (symmetric)", "Asymmetric"],
                     horizontal=True,
+                    index=_widget_index("dc_type", 0),
                     key="dc_type",
                     help=(
                         "**Twin**: S_gp is split equally between cathodes; "
@@ -1123,7 +1295,7 @@ def _render_configure_tab():
 def _render_run_tab():
     st.header("Run Parameter Sweep")
 
-    db_path = _render_path_input("run_db", "Database path", "~/lapd_data/sweep.h5")
+    db_path = _render_path_input("run_db", "Database path", str(_DEFAULT_DB_PATH))
     db_path_exp = os.path.expanduser(db_path)
 
     col1, col2, _col3 = st.columns(3)
@@ -1263,7 +1435,8 @@ def _render_run_tab():
         )
 
     # ── Progress display ───────────────────────────────────────────────────────
-    if "sweep_state" in st.session_state:
+    _render_sweep_progress()
+    if False and "sweep_state" in st.session_state:
         _drain_queue()
         state: SweepState = st.session_state["sweep_state"]
 
@@ -1292,12 +1465,12 @@ def _render_run_tab():
                 st.progress(frac, text=text)
                 if seg_wall > 30:
                     import pathlib as _pl
-                    _db_dir = _pl.Path(state.db_path).expanduser().parent if state.db_path else _pl.Path("~").expanduser()
+                    _db_dir = _log_dir(state.db_path) if state.db_path else _pl.Path("~").expanduser()
                     _db_stem = _pl.Path(state.db_path).stem if state.db_path else "sweep"
                     st.warning(
                         f"{rid}: very slow — {seg_wall:.0f}s per 1ms of sim time. "
                         f"Check worker logs for step size (h= lines): "
-                        f"`{_db_dir}/{_db_stem}.worker_*.log`  "
+                        f"`{_db_dir}/{_db_stem}.*.worker_*.log`  "
                         "Possible causes: CFL-forced tiny steps, or resource contention."
                     )
 
@@ -1340,7 +1513,7 @@ def _render_run_tab():
 
 def _render_explore_tab():
     st.header("Explore Database")
-    db_path = _render_path_input("explore_db", "Database path", "~/lapd_data/sweep.h5")
+    db_path = _render_path_input("explore_db", "Database path", str(_DEFAULT_DB_PATH))
     db_path = os.path.expanduser(db_path)
     if not os.path.exists(db_path):
         st.warning(f"File not found: `{db_path}`")
