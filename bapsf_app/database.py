@@ -105,6 +105,14 @@ def _promote_dataset_to_strings(grp, key):
     return grp[key]
 
 
+def _promote_dataset_to_float(grp, key):
+    """Replace an existing integer index dataset with a float64 one."""
+    old = grp[key][:].astype("f8")
+    del grp[key]
+    grp.create_dataset(key, data=old, maxshape=(None,), dtype="f8")
+    return grp[key]
+
+
 def _pad_array(arr, n_rows: int, pad_value):
     """Return an array/list padded or trimmed to match the index row count."""
     if isinstance(arr, list):
@@ -113,6 +121,8 @@ def _pad_array(arr, n_rows: int, pad_value):
         return values
 
     arr = np.asarray(arr)
+    if arr.dtype.kind in ("i", "u", "b") and isinstance(pad_value, float) and np.isnan(pad_value):
+        arr = arr.astype("f8")
     if len(arr) >= n_rows:
         return arr[:n_rows]
     pad = np.full(n_rows - len(arr), pad_value, dtype=arr.dtype)
@@ -151,6 +161,8 @@ def _append_dataset(grp, key, val):
         elif isinstance(np_val, str):
             ds = _promote_dataset_to_strings(grp, key)
             np_val = _stringify_index_value(val)
+        elif ds.dtype.kind in ("i", "u", "b") and isinstance(np_val, np.floating):
+            ds = _promote_dataset_to_float(grp, key)
         n = ds.shape[0]
         ds.resize((n + 1,))
         ds[n] = np_val
