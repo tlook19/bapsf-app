@@ -460,7 +460,12 @@ def rebuild_index(db):
             stats = {k: float(v) for k, v in grp["stats_10_20ms"].attrs.items()}
 
         # Recompute stats from raw arrays if any keys are missing (e.g. after schema update)
-        _required = {"ne_var", "ne_tvar", "ne_tcov", "ne_total_var", "Te_var", "Te_tvar", "Te_tcov", "Te_total_var", "P_net_mean", "P_eff", "P_net_total", "P_eff_total"}
+        _required = {
+            "ne_var", "ne_tvar", "ne_tcov", "ne_total_var",
+            "Te_var", "Te_tvar", "Te_tcov", "Te_total_var",
+            "P_peak", "I_tot_peak", "V_b_at_I_tot_peak",
+            "P_net_mean", "P_eff", "P_net_total", "P_eff_total",
+        }
         if status == "ok" and not _required.issubset(stats.keys()) and "ne" in grp and "time" in grp:
             from bapsf_app.stats import compute_window_stats
             try:

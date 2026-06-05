@@ -45,6 +45,7 @@ from bapsf_app.plot import (
     plot_sweep_variance,
     plot_sweep_heatmap,
 )
+from bapsf_app.stats import compute_cathode_peak_stats
 
 # ── Sweep progress manifest (persisted alongside the HDF5 database) ───────────
 
@@ -1074,6 +1075,50 @@ def _index_to_df(idx):
     return df
 
 
+def _add_peak_stats_to_index_df(df, db_path):
+    """Populate peak cathode metric columns from raw runs if the index lacks them."""
+    peak_cols = {
+        "P_peak": "s:P_peak",
+        "I_tot_peak": "s:I_tot_peak",
+        "V_b_at_I_tot_peak": "s:V_b_at_I_tot_peak",
+    }
+    if df.empty:
+        return df
+    missing_or_empty = [
+        stat_key for stat_key, col in peak_cols.items()
+        if col not in df.columns or df[col].isna().all()
+    ]
+    if not missing_or_empty:
+        return df
+
+    df = df.copy()
+    with open_db(db_path) as db:
+        for i, row in df.iterrows():
+            if row.get("status") != "ok":
+                continue
+            run_id = row.get("run_id")
+            try:
+                _, _, results = load_run(db, run_id, keys=["cathode"])
+                peak_stats = compute_cathode_peak_stats(results)
+            except Exception:
+                continue
+            for stat_key, col in peak_cols.items():
+                if stat_key in missing_or_empty:
+                    df.loc[i, col] = peak_stats.get(stat_key, float("nan"))
+    return df
+
+
+def _format_metric_value(value, fmt):
+    """Format a metric value, returning an em dash for missing/NaN values."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if np.isnan(value):
+        return "—"
+    return fmt.format(value)
+
+
 # ── Tab renderers ─────────────────────────────────────────────────────────────
 
 @st.fragment(run_every=1.0)
@@ -1581,17 +1626,27 @@ def _render_explore_tab():
     with sub_tabs[0]:
         st.subheader("Run Index")
         df = _index_to_df(idx)
+        df = _add_peak_stats_to_index_df(df, db_path)
         col_conf = {
             col: st.column_config.NumberColumn(format="%.3e")
             for col in df.columns
             if col.startswith(("p:", "s:"))
         }
         col_conf["p:T_s_C"] = st.column_config.NumberColumn("T_s [°C]", format="%.0f")
+        col_conf["s:P_peak"] = st.column_config.NumberColumn("Peak power [W]", format="%.3e")
+        col_conf["s:I_tot_peak"] = st.column_config.NumberColumn("Peak I_tot [A]", format="%.3e")
+        col_conf["s:V_b_at_I_tot_peak"] = st.column_config.NumberColumn(
+            "V_b at peak I_tot [V]", format="%.3e"
+        )
         # Default visible columns; all columns still available in CSV export
         _DEFAULT_PARAMS = ["V_bank", "T_s_C", "gas_type", "nn0", "S_gp", "Twin_S_gp"]
         default_cols = ["run_id", "status", "n_cells"]
         default_cols += [f"p:{k}" for k in _DEFAULT_PARAMS if f"p:{k}" in df.columns]
         default_cols += [c for c in df.columns if c.startswith("f:")]
+        default_cols += [
+            c for c in ("s:P_peak", "s:I_tot_peak", "s:V_b_at_I_tot_peak")
+            if c in df.columns
+        ]
         st.dataframe(df, width="stretch", height=500, column_config=col_conf,
                      column_order=default_cols)
         csv = df.to_csv(index=False).encode()
@@ -1740,6 +1795,22 @@ def _render_explore_tab():
                 st.pyplot(figs[fig_name], width="stretch")
                 for f in figs.values():
                     plt.close(f)
+
+                peak_stats = compute_cathode_peak_stats(results)
+                st.markdown("**Cathode peak metrics**")
+                st.dataframe(
+                    [
+                        {
+                            "Peak power [W]": _format_metric_value(peak_stats.get("P_peak"), "{:.3e}"),
+                            "Peak I_tot [A]": _format_metric_value(peak_stats.get("I_tot_peak"), "{:.3e}"),
+                            "V_b at peak I_tot [V]": _format_metric_value(
+                                peak_stats.get("V_b_at_I_tot_peak"), "{:.3e}"
+                            ),
+                        }
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
 
                 with st.expander("Run parameters"):
                     col_p, col_f = st.columns(2)
