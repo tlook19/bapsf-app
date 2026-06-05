@@ -4,6 +4,51 @@ Per-run and cross-run statistics for LAPDSim results.
 import numpy as np
 
 
+def compute_cathode_peak_stats(results):
+    """
+    Compute peak cathode power from the primary cathode time series.
+
+    Peak power is defined from the peak primary-cathode ``I_tot`` and the
+    ``V_b`` sample at the same timestep.
+    """
+    _get = (lambda k: results[k]) if isinstance(results, dict) else (lambda k: getattr(results, k))
+
+    stats = {
+        "P_peak": float("nan"),
+        "I_tot_peak": float("nan"),
+        "V_b_at_I_tot_peak": float("nan"),
+    }
+    try:
+        cathode_obj = _get("cathode")
+        _cget = (
+            (lambda k: cathode_obj[k])
+            if isinstance(cathode_obj, dict)
+            else (lambda k: getattr(cathode_obj, k))
+        )
+        i_tot = np.asarray(_cget("I_tot"), dtype=float)
+        v_b = np.asarray(_cget("V_b"), dtype=float)
+        if i_tot.size == 0 or v_b.size == 0:
+            return stats
+
+        n = min(i_tot.size, v_b.size)
+        i_tot = i_tot[:n]
+        v_b = v_b[:n]
+        valid = np.isfinite(i_tot) & np.isfinite(v_b)
+        if not np.any(valid):
+            return stats
+
+        valid_indices = np.flatnonzero(valid)
+        peak_idx = valid_indices[np.argmax(i_tot[valid])]
+        peak_i = float(i_tot[peak_idx])
+        peak_v = float(v_b[peak_idx])
+        stats["I_tot_peak"] = peak_i
+        stats["V_b_at_I_tot_peak"] = peak_v
+        stats["P_peak"] = peak_i * peak_v
+    except (KeyError, AttributeError, TypeError, IndexError):
+        pass
+    return stats
+
+
 def cell_centers(n_cells, L_plasma, convention="sim"):
     """
     Compute cell-center axial positions.
@@ -104,6 +149,8 @@ def compute_window_stats(results, t_window=(10.0, 20.0)):
         stats[f"{key}_min"] = float(arr_i.min())
         stats[f"{key}_max"] = float(arr_i.max())
         stats[f"{key}_mean"] = overall_mean
+
+    stats.update(compute_cathode_peak_stats(results))
 
     # Cathode power stats: P_net_mean and P_eff = P_net_mean / P_wall_mean
     try:
