@@ -44,6 +44,7 @@ from bapsf_app.plot import (
     plot_run_comparison,
     plot_sweep_variance,
     plot_sweep_heatmap,
+    plot_time_slice,
 )
 from bapsf_app.stats import compute_cathode_peak_stats
 
@@ -322,6 +323,10 @@ PARAM_META: dict[str, dict] = {
         "label": "Discharge duration (tau_discharge)", "unit": "s", "default": 20e-3,
         "type": "float", "group": "Time & Solver",
     },
+    "tau_gp_after_breakdown": {
+        "label": "Gas puff shutoff after breakdown (tau_gp_after_breakdown)", "unit": "ms",
+        "default": None, "type": "float_or_none", "group": "Time & Solver",
+    },
     "tau_afterglow": {
         "label": "Afterglow duration (tau_afterglow)", "unit": "s", "default": 5e-3,
         "type": "float", "group": "Time & Solver",
@@ -423,10 +428,29 @@ for _k in list(PARAM_META.keys()) + list(TWIN_META.keys()):
     _PARAM_CFG_KEYS += [
         f"pmode_{_k}", f"pfixed_{_k}",
         f"pmin_{_k}", f"pmax_{_k}", f"pstep_{_k}", f"pvary_{_k}",
+        f"penable_{_k}",
     ]
 _FLAG_CFG_KEYS: list[str] = [f"flag_{k}" for k in FLAG_META]
 _MISC_CFG_KEYS: list[str] = ["dc_on_off", "dc_type"]
 _ALL_CFG_KEYS: list[str] = _PARAM_CFG_KEYS + _FLAG_CFG_KEYS + _MISC_CFG_KEYS
+
+_SLICE_META_LABELS: dict[str, str] = {
+    "ne":           "Electron density",
+    "nn":           "Neutral density",
+    "Te":           "Electron temp",
+    "Ti":           "Ion temp",
+    "v_plasma":     "Plasma velocity",
+    "isat":         "Ion sat. current",
+    "ion_fraction": "Ionization fraction",
+    "density_flux": "Density flux",
+    "electron_heat_terms": "Electron heat terms",
+    "ion_heat_terms":       "Ion heat terms",
+    "density_source_terms": "Density source/sink terms",
+    "Ne_face_flux":         "Electron face flux",
+    "Nn_face_flux":         "Neutral face flux",
+    "e_par_face_flux":      "e⁻ parallel heat face flux",
+    "i_par_face_flux":      "Ion parallel heat face flux",
+}
 
 
 def _get_serializable_state() -> dict:
@@ -483,7 +507,12 @@ def _load_defaults() -> None:
     for key, meta in PARAM_META.items():
         st.session_state[f"pmode_{key}"] = "Fixed"
         default = meta["default"]
-        st.session_state[f"pfixed_{key}"] = default if meta["type"] == "str" else float(default)
+        if meta["type"] == "str":
+            st.session_state[f"pfixed_{key}"] = default
+        elif meta["type"] == "float_or_none":
+            st.session_state[f"penable_{key}"] = False
+        else:
+            st.session_state[f"pfixed_{key}"] = float(default)
     for key, meta in TWIN_META.items():
         st.session_state[f"pmode_{key}"] = "Fixed"
         st.session_state[f"pfixed_{key}"] = float(meta["default"])
@@ -654,6 +683,47 @@ def _render_param_row(key: str, meta: dict) -> None:
             _set_ss(f"param_{key}", {"mode": "range", "values": selected or choices})
         return
 
+    # Optional float (None = disabled / use solver default)
+    if param_type == "float_or_none":
+        mode_key = f"pmode_{key}"
+        mode = st.radio(
+            f"##mode_{key}", ["Fixed", "Range"], horizontal=True,
+            index=_widget_index(mode_key, 0),
+            label_visibility="collapsed", key=mode_key,
+        )
+        enable_key = f"penable_{key}"
+        enabled = st.checkbox(
+            "Enable (blank = use solver default / None)",
+            value=_widget_value(enable_key, False),
+            key=enable_key,
+        )
+        if not enabled:
+            _set_ss(f"param_{key}", {"mode": "fixed", "value": None})
+            st.divider()
+            return
+        fmt = "%g"
+        if mode == "Fixed":
+            fixed_key = f"pfixed_{key}"
+            val_ms = st.number_input(
+                f"##fix_{key}", value=_widget_value(fixed_key, 2.0),
+                format=fmt, label_visibility="collapsed", key=fixed_key,
+                min_value=0.0,
+            )
+            _set_ss(f"param_{key}", {"mode": "fixed", "value": val_ms / 1e3})
+        else:
+            c1, c2, c3 = st.columns(3)
+            min_key = f"pmin_{key}"
+            max_key = f"pmax_{key}"
+            step_key = f"pstep_{key}"
+            min_v = c1.number_input("Min", value=_widget_value(min_key, 0.5), format=fmt, key=min_key, min_value=0.0)
+            max_v = c2.number_input("Max", value=_widget_value(max_key, 5.0), format=fmt, key=max_key, min_value=0.0)
+            step_v = c3.number_input("Step", value=_widget_value(step_key, 0.5), format=fmt, key=step_key, min_value=1e-30)
+            vals = _arange_inclusive(min_v, max_v, step_v)
+            st.caption(f"→ {_format_vals(vals)} ms")
+            _set_ss(f"param_{key}", {"mode": "range", "values": (vals / 1e3).tolist()})
+        st.divider()
+        return
+
     # Numeric (float / int)
     mode_key = f"pmode_{key}"
     mode = st.radio(
@@ -822,6 +892,8 @@ def _fmt_val(v) -> str:
     """Format a parameter value, using scientific notation for large/small floats."""
     if isinstance(v, str):
         return v
+    if v is None:
+        return "None"
     if isinstance(v, bool):
         return str(v)
     if isinstance(v, (int, np.integer)):
@@ -1811,6 +1883,35 @@ def _render_explore_tab():
                     width="stretch",
                     hide_index=True,
                 )
+
+                st.divider()
+                st.markdown("**Time slice**")
+                _face_keys = {"Ne_face_flux", "Nn_face_flux", "e_par_face_flux", "i_par_face_flux"}
+                _slice_quantities = [
+                    q for q in _SLICE_META_LABELS
+                    if q not in _face_keys or q in results
+                ]
+                ts_col1, ts_col2 = st.columns([1, 2])
+                _t_arr = results["time"]
+                _t_min, _t_max = float(_t_arr[0]), float(_t_arr[-1])
+                _t_mid = float(_t_arr[len(_t_arr) // 2])
+                slice_qty = ts_col1.selectbox(
+                    "Quantity",
+                    _slice_quantities,
+                    key="slice_qty",
+                    format_func=lambda q: _SLICE_META_LABELS[q],
+                )
+                slice_t = ts_col2.slider(
+                    "Time (ms)",
+                    min_value=_t_min,
+                    max_value=_t_max,
+                    value=st.session_state.get("slice_t", _t_mid),
+                    step=(_t_max - _t_min) / max(len(_t_arr) - 1, 1),
+                    key="slice_t",
+                )
+                fig_slice = plot_time_slice(results, params, z_conv, slice_t, slice_qty)
+                st.pyplot(fig_slice, use_container_width=True)
+                plt.close(fig_slice)
 
                 with st.expander("Run parameters"):
                     col_p, col_f = st.columns(2)

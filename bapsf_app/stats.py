@@ -49,9 +49,37 @@ def compute_cathode_peak_stats(results):
     return stats
 
 
+_CATHODE_CELL_LEN = 100.0  # cm — fixed boundary cell length, matches LAPDSim._cathode_cell_len
+
+
+def _cell_lengths(n_cells, L_plasma):
+    """
+    Cell length array matching LAPDSim._build_L_plasma.
+
+    The two outermost cells are fixed at 100 cm (cathode region); all interior
+    cells share the remaining length equally.  For n_cells < 3 the function
+    falls back to uniform lengths to avoid division by zero.
+
+    Returns
+    -------
+    np.ndarray, shape (n_cells,), lengths in cm
+    """
+    if n_cells < 3:
+        return np.full(n_cells, L_plasma / max(n_cells, 1))
+    n_interior = n_cells - 2
+    interior_L = (L_plasma - 2 * _CATHODE_CELL_LEN) / n_interior
+    arr = np.full(n_cells, interior_L)
+    arr[0] = _CATHODE_CELL_LEN
+    arr[-1] = _CATHODE_CELL_LEN
+    return arr
+
+
 def cell_centers(n_cells, L_plasma, convention="sim"):
     """
-    Compute cell-center axial positions.
+    Compute cell-center axial positions using the actual LAPDSim mesh layout.
+
+    The two boundary cells are fixed at 100 cm; interior cells share the
+    remaining length uniformly.
 
     Parameters
     ----------
@@ -60,17 +88,43 @@ def cell_centers(n_cells, L_plasma, convention="sim"):
         Plasma column length [cm].
     convention : str
         'sim'  — z=0 at source/left end.
-            centers = [(i + 0.5) * L_plasma / n_cells]
-            e.g. 3 cells, 1800 cm → [300, 900, 1500] cm
-        'exp'  — z=0 at far/right end (experimental/machine convention).
-            centers = L_plasma - sim_centers
-            e.g. 3 cells, 1800 cm → [1500, 900, 300] cm
+        'exp'  — z=0 at far/right end (experimental convention).
 
     Returns
     -------
     np.ndarray, shape (n_cells,)
     """
-    sim_z = np.array([(i + 0.5) * L_plasma / n_cells for i in range(n_cells)])
+    lengths = _cell_lengths(n_cells, L_plasma)
+    left_edges = np.concatenate([[0.0], np.cumsum(lengths[:-1])])
+    sim_z = left_edges + 0.5 * lengths
+    if convention == "sim":
+        return sim_z
+    else:
+        return L_plasma - sim_z
+
+
+def face_centers(n_cells, L_plasma, convention="sim"):
+    """
+    Compute face (interface) axial positions between cells.
+
+    Face i lies between cell i and cell i+1, so there are n_cells-1 faces.
+    Uses the actual LAPDSim mesh layout (fixed 100 cm boundary cells).
+
+    Parameters
+    ----------
+    n_cells : int
+        Number of cells in the current mesh.
+    L_plasma : float
+        Plasma column length [cm].
+    convention : str
+        'sim' or 'exp' — same convention as cell_centers().
+
+    Returns
+    -------
+    np.ndarray, shape (n_cells - 1,)
+    """
+    lengths = _cell_lengths(n_cells, L_plasma)
+    sim_z = np.cumsum(lengths[:-1])
     if convention == "sim":
         return sim_z
     else:

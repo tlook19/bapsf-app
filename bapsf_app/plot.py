@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import FuncFormatter
 
-from .stats import cell_centers
+from .stats import cell_centers, face_centers
 
 _qe_SI = 1.602176634e-19  # J per eV
 
@@ -594,6 +594,35 @@ def _plot_contour(results, params, flags, z_pos, z_convention, save_dir):
         figs["v_plasma"] = fig
         _save(fig, "v_plasma", save_dir)
 
+    # ── Face-centred particle fluxes ───────────────────────────────────────────
+    _face_flux_fields = [
+        ("Ne_face_flux", r"$\Gamma_{e,\,\mathrm{face}}$ [cm$^{-2}$s$^{-1}$]", "Electron face flux"),
+        ("Nn_face_flux", r"$\Gamma_{n,\,\mathrm{face}}$ [cm$^{-2}$s$^{-1}$]", "Neutral face flux"),
+    ]
+    _heat_face_fields = [
+        ("e_par_face_flux", r"$Q_{e,\parallel,\,\mathrm{face}}$ [eV cm$^{-2}$s$^{-1}$]", "Electron parallel heat face flux"),
+        ("i_par_face_flux", r"$Q_{i,\parallel,\,\mathrm{face}}$ [eV cm$^{-2}$s$^{-1}$]", "Ion parallel heat face flux"),
+    ]
+    for _fname, _cbar, _title in _face_flux_fields + _heat_face_fields:
+        if _fname not in results:
+            continue
+        _fdata = np.where(np.isfinite(results[_fname]), results[_fname], np.nan)
+        # Face arrays have shape (n_t, max_cells-1) with NaN padding for adaptive mesh.
+        _n_face = _fdata.shape[1]
+        # Infer cell count from cell-centered arrays (ne shape gives max_cells).
+        _n_cells_max = results["ne"].shape[1]
+        if _n_face != _n_cells_max - 1:
+            # Unexpected shape — skip rather than shift data by half a cell.
+            continue
+        _zf = face_centers(_n_cells_max, L_plasma, convention=z_convention)
+        _Zf_mesh, _Tf_mesh = np.meshgrid(_zf, t)
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4), constrained_layout=True)
+        _contour_panel(ax, fig, _Zf_mesh, _Tf_mesh, _fdata, _title, _cbar,
+                       is_log=False, **_kw)
+        fig.suptitle(f"{_title}\n{title_base}", fontsize=10)
+        figs[_fname] = fig
+        _save(fig, _fname, save_dir)
+
     return figs
 
 
@@ -918,4 +947,154 @@ def plot_run_comparison(db_path, run_ids, quantity, cell_idx=-1):
                   loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
 
     ax.grid(True, alpha=0.3)
+    return fig
+
+
+# ── Time-slice plot ───────────────────────────────────────────────────────────
+
+_SLICE_META = {
+    "ne":            ("Electron density",   "cm⁻³", False),
+    "nn":            ("Neutral density",    "cm⁻³", False),
+    "Te":            ("Electron temp",      "eV",   False),
+    "Ti":            ("Ion temp",           "eV",   False),
+    "v_plasma":      ("Plasma velocity",    "cm/s", False),
+    "isat":          ("Ion sat. current",   "norm", False),
+    "ion_fraction":  ("Ionization fraction", "ne/nn",       False),
+    "density_flux":  ("Density flux",        "cm⁻²·s⁻¹",   False),
+    "electron_heat_terms": ("Electron heat terms", "eV/s", False),
+    "ion_heat_terms":          ("Ion heat terms",          "eV/s",    False),
+    "density_source_terms":    ("Density source/sink terms", "cm⁻³/s", False),
+    # Face-centred flux fields — plotted on face z positions, not cell centres.
+    "Ne_face_flux":      ("Electron face flux",           "cm⁻²·s⁻¹", False),
+    "Nn_face_flux":      ("Neutral face flux",            "cm⁻²·s⁻¹", False),
+    "e_par_face_flux":   ("e⁻ parallel heat face flux",  "eV·cm⁻²·s⁻¹", False),
+    "i_par_face_flux":   ("Ion parallel heat face flux",  "eV·cm⁻²·s⁻¹", False),
+}
+
+_FACE_FLUX_KEYS = {"Ne_face_flux", "Nn_face_flux", "e_par_face_flux", "i_par_face_flux"}
+
+_ELECTRON_HEAT_TERMS = ["Qie", "Qei", "Qen", "Qeb", "e_par_flux"]
+_ION_HEAT_TERMS = ["Qie", "Qcx", "Qib", "i_par_flux"]
+_DENSITY_SOURCE_TERMS = ["S_ion_bulk", "S_ion_beam", "S_rec_rad", "S_rec_3b", "Ne_flux"]
+
+
+def _plot_signed_abs_line(ax, z, y, label, color):
+    """Plot abs(y) as a line with scatter dots colored by the sign of y.
+
+    Positive values → filled circles; negative values → filled triangles-down.
+    Adds a single legend entry for the line plus two proxy entries for sign.
+    """
+    from matplotlib.lines import Line2D
+
+    yabs = np.abs(y)
+    ax.plot(z, yabs, color=color, linewidth=1.5, zorder=2)
+
+    pos = y >= 0
+    ax.scatter(z[pos],  yabs[pos],  color=color, marker="o", s=30, zorder=3,
+               label=f"{label} (+)")
+    ax.scatter(z[~pos], yabs[~pos], color=color, marker="v", s=30, zorder=3,
+               label=f"{label} (−)")
+
+
+def plot_time_slice(results, params, z_convention, t_ms, quantity):
+    """Plot quantity vs. z position at the time step nearest to t_ms.
+
+    Parameters
+    ----------
+    results : dict
+        Output of load_run(); must contain "time" and the requested quantity.
+    params : dict
+        Simulation parameters; needs "Lp" and "cells".
+    z_convention : str
+        "sim" (z=0 at source) or "exp" (z=0 at far end).
+    t_ms : float
+        Requested time in milliseconds.
+    quantity : str
+        One of the keys in _SLICE_META.
+
+    Returns
+    -------
+    matplotlib.Figure
+    """
+    label, units, use_log = _SLICE_META[quantity]
+
+    time = np.asarray(results["time"])
+    idx = int(np.argmin(np.abs(time - t_ms)))
+    t_actual = float(time[idx])
+
+    Lp = float(params["Lp"])
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    if quantity in ("electron_heat_terms", "ion_heat_terms", "density_source_terms"):
+        terms = (
+            _ELECTRON_HEAT_TERMS if quantity == "electron_heat_terms"
+            else _ION_HEAT_TERMS if quantity == "ion_heat_terms"
+            else _DENSITY_SOURCE_TERMS
+        )
+        signed_terms = {"e_par_flux", "i_par_flux", "Qie",
+                        "S_ion_bulk", "S_ion_beam", "S_rec_rad", "S_rec_3b", "Ne_flux"}
+        prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        for i, term in enumerate(terms):
+            color = prop_cycle[i % len(prop_cycle)]
+            data2d = np.asarray(results[term])
+            y = data2d[idx, :]
+            z = cell_centers(data2d.shape[1], Lp, convention=z_convention)
+            valid = ~np.isnan(y)
+            zv, yv = z[valid], y[valid]
+
+            if term in signed_terms:
+                # For Qie in the electron plot: positive = loss, so negate to
+                # match the convention that (+) = heating, (−) = loss.
+                yplot_signed = -yv if (term == "Qie" and quantity == "electron_heat_terms") else yv
+                _plot_signed_abs_line(ax, zv, yplot_signed, term, color)
+            else:
+                yplot = np.abs(yv) if term == "Qib" else yv
+                ax.plot(zv, yplot, color=color, marker="o", markersize=4,
+                        linewidth=1.5, label=term)
+        ax.legend(fontsize=8)
+        ax.set_yscale("log")
+        y_top = 1e20 if quantity == "density_source_terms" else 1e8
+        ax.set_ylim(bottom=1e-3, top=y_top)
+    elif quantity in _FACE_FLUX_KEYS:
+        data2d = np.asarray(results[quantity])
+        y = data2d[idx, :]
+        # Face arrays have n_cells-1 positions; infer n_cells from ne shape.
+        n_cells_max = results["ne"].shape[1]
+        z = face_centers(n_cells_max, Lp, convention=z_convention)
+        valid = ~np.isnan(y)
+        z, y = z[valid], y[valid]
+        ax.plot(z, y, marker="s", markersize=4, linewidth=1.5)
+        ax.axhline(0, color="k", lw=0.6, ls="--")
+    else:
+        if quantity == "ion_fraction":
+            data2d = np.asarray(results["ne"]) / np.asarray(results["nn"])
+        elif quantity == "density_flux":
+            data2d = np.asarray(results["ne"]) * np.asarray(results["v_plasma"])
+        else:
+            data2d = np.asarray(results[quantity])
+        y = data2d[idx, :]
+
+        # Use the actual padded array width so z and y have the same length;
+        # NaN filtering below strips the padding columns.
+        z = cell_centers(data2d.shape[1], Lp, convention=z_convention)
+
+        valid = ~np.isnan(y)
+        z, y = z[valid], y[valid]
+
+        ax.plot(z, y, marker="o", markersize=4, linewidth=1.5)
+
+        if use_log and np.any(y[y > 0]):
+            ax.set_yscale("log")
+
+    ax.set_xlabel(_z_axis_label(z_convention))
+    ax.set_ylabel(f"{label} [{units}]")
+    ax.set_title(f"{label} at t = {t_actual:.3f} ms")
+
+    _PROBE_Z_SIM = [758.0, 1045.0, 1397.0]  # cm, sim convention (z=0 at source)
+    for _pz in _PROBE_Z_SIM:
+        _plot_z = _pz if z_convention == "sim" else Lp - _pz
+        ax.axvline(_plot_z, color="gray", lw=0.8, ls="--", alpha=0.7)
+
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
     return fig
