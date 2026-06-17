@@ -31,13 +31,24 @@ import numpy as np
 import psutil
 import streamlit as st
 
+try:
+    import setproctitle
+
+    setproctitle.setproctitle("bapsf-app")
+except ImportError:
+    pass
+
 matplotlib.use("Agg")  # non-interactive backend required for Streamlit
 
 _WORKSPACE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _DEFAULT_DB_PATH = _WORKSPACE_ROOT / "database" / "sweep.h5"
 
 # Absolute imports (relative imports fail when Streamlit runs app.py as __main__)
-from bapsf_app.sweep import grid_sweep_parallel, param_combinations
+from bapsf_app.sweep import (
+    get_worker_affinity_info,
+    grid_sweep_parallel,
+    param_combinations,
+)
 from bapsf_app.database import open_db, load_index, list_runs, load_run, rebuild_index, update_index
 from bapsf_app.plot import (
     plot_run,
@@ -1415,8 +1426,16 @@ def _render_run_tab():
     db_path = _render_path_input("run_db", "Database path", str(_DEFAULT_DB_PATH))
     db_path_exp = os.path.expanduser(db_path)
 
+    worker_cpu_info = get_worker_affinity_info()
+    worker_cpu_count = max(int(worker_cpu_info.get("count") or 1), 1)
+    logical_cpu_count = max(int(worker_cpu_info.get("logical_count") or worker_cpu_count), 1)
+    max_workers = worker_cpu_count if worker_cpu_info.get("limited") else logical_cpu_count
+    max_workers = max(max_workers, 1)
+    current_workers = int(st.session_state.get("run_n_workers", 1))
+    if current_workers > max_workers:
+        st.session_state["run_n_workers"] = max_workers
+
     col1, col2, _col3 = st.columns(3)
-    max_workers = psutil.cpu_count(logical=True) or 4
     n_workers = col1.number_input("Workers", min_value=1, max_value=max_workers,
                                   value=1, key="run_n_workers")
     with col2:
@@ -1424,6 +1443,26 @@ def _render_run_tab():
                                   key="run_t_start")
         t_end = st.number_input("t_window end (ms, 0=breakdown)", min_value=0.0, value=20.0,
                                 key="run_t_end")
+
+    if worker_cpu_info.get("limited"):
+        cpu_ids = worker_cpu_info.get("cpus") or []
+        if worker_cpu_info.get("source") == "BAPSF_WORKER_CPUS":
+            label = "Worker CPU override"
+        else:
+            label = "Detected P-core worker pool"
+        st.caption(
+            f"{label}: {worker_cpu_count} logical CPU(s) "
+            f"out of {logical_cpu_count}. Worker launch is capped to this count. "
+            f"CPU IDs: {cpu_ids}"
+        )
+    else:
+        note = (
+            "P-core detection unavailable; workers are not affinity-limited "
+            f"(logical CPUs: {logical_cpu_count})."
+        )
+        if worker_cpu_info.get("error"):
+            note += f" Detection note: {worker_cpu_info['error']}."
+        st.caption(note)
 
     # ── Reconnect / interrupt banner ──────────────────────────────────────────
     already_running = st.session_state.get("sweep_running", False)
@@ -1460,7 +1499,8 @@ def _render_run_tab():
     if n_workers > 1:
         st.info(
             f"Parallel mode: {n_workers} workers.  "
-            "Simulations run in separate processes; HDF5 writes are serialised on the main thread."
+            "Simulations run in separate processes; HDF5 writes are serialised on the main thread. "
+            "On Windows hybrid CPUs, workers are pinned to the detected P-core CPU set."
         )
 
     equilibrate_nn = st.checkbox(

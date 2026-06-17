@@ -541,6 +541,7 @@ def _plot_2d(results, params, flags, z_pos, z_convention, save_dir):
 def _plot_contour(results, params, flags, z_pos, z_convention, save_dir):
     """Position-vs-time contour plots for >5 cells."""
     t = results["time"]
+    L_plasma = params.get("Lp", params.get("L_plasma", 1800))
     title_base = _run_title(params, flags)
     z_label = _z_axis_label(z_convention)
     figs = {}
@@ -1022,7 +1023,7 @@ def plot_time_slice(results, params, z_convention, t_ms, quantity):
     idx = int(np.argmin(np.abs(time - t_ms)))
     t_actual = float(time[idx])
 
-    Lp = float(params["Lp"])
+    Lp = float(params.get("Lp", params.get("L_plasma", 1800)))
     fig, ax = plt.subplots(figsize=(7, 4))
 
     if quantity in ("electron_heat_terms", "ion_heat_terms", "density_source_terms"):

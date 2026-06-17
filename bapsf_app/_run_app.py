@@ -12,7 +12,7 @@ import pathlib
 
 try:
     import setproctitle
-    setproctitle.setproctitle("lapd-app")
+    setproctitle.setproctitle("bapsf-app")
 except ImportError:
     pass
 
