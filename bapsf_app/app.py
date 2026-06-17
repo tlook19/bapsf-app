@@ -263,8 +263,17 @@ PARAM_META: dict[str, dict] = {
         "label": "Power supply voltage (V_bank)", "unit": "V", "default": 100.0,
         "type": "float", "group": "Discharge (Primary Cathode)",
     },
+    "gas_puff_mode": {
+        "label": "Gas puff mode (gas_puff_mode)", "unit": "",
+        "default": "decay_after_breakdown", "type": "str", "group": "Discharge (Primary Cathode)",
+        "choices": ["decay_after_breakdown", "pulse_decay_to_level"],
+    },
     "S_gp": {
         "label": "Gas puff source rate (S_gp)", "unit": "", "default": 500.0,
+        "type": "float", "group": "Discharge (Primary Cathode)",
+    },
+    "S_gp_decay_target": {
+        "label": "Gas puff target rate (S_gp_decay_target)", "unit": "", "default": 0.0,
         "type": "float", "group": "Discharge (Primary Cathode)",
     },
     "T_s": {
@@ -342,6 +351,14 @@ PARAM_META: dict[str, dict] = {
         "label": "Gas puff decay time factor (tau_gp_decay_factor)", "unit": "",
         "default": 1.0, "type": "float", "group": "Time & Solver",
     },
+    "tau_gp_pulse_duration": {
+        "label": "Gas puff pulse duration (tau_gp_pulse_duration)", "unit": "s",
+        "default": 0.0, "type": "float", "group": "Time & Solver",
+    },
+    "tau_gp_decay_duration": {
+        "label": "Gas puff decay duration (tau_gp_decay_duration)", "unit": "s",
+        "default": 1e-3, "type": "float", "group": "Time & Solver",
+    },
     "tau_afterglow": {
         "label": "Afterglow duration (tau_afterglow)", "unit": "s", "default": 5e-3,
         "type": "float", "group": "Time & Solver",
@@ -404,6 +421,12 @@ PARAM_META: dict[str, dict] = {
 # the neutral-side initial conditions differ per cathode.
 TWIN_META: dict[str, dict] = {
     "Twin_S_gp": {"label": "Twin gas puff rate (Twin_S_gp)", "unit": "", "default": 500.0, "type": "float"},
+    "Twin_S_gp_decay_target": {
+        "label": "Twin gas puff target rate (Twin_S_gp_decay_target)",
+        "unit": "",
+        "default": 0.0,
+        "type": "float",
+    },
 }
 
 FLAG_META: dict[str, dict] = {
@@ -880,6 +903,14 @@ def _build_sweep_config():
         if twin_active and _sym:
             params["S_gp"] = params.get("S_gp", PARAM_META["S_gp"]["default"]) / 2.0
             params["Twin_S_gp"] = params["S_gp"]
+            params["S_gp_decay_target"] = (
+                params.get(
+                    "S_gp_decay_target",
+                    PARAM_META["S_gp_decay_target"]["default"],
+                )
+                / 2.0
+            )
+            params["Twin_S_gp_decay_target"] = params["S_gp_decay_target"]
         return params
 
     return param_ranges, flag_ranges, fixed_params, fixed_flags, _param_transform
