@@ -387,6 +387,10 @@ PARAM_META: dict[str, dict] = {
         "label": "Max step, afterglow (h_max_afterglow)", "unit": "s", "default": 1e-4,
         "type": "float", "group": "Time & Solver",
     },
+    "max_step_rejections": {
+        "label": "Max consecutive step rejections (max_step_rejections)", "unit": "",
+        "default": 200, "type": "int", "group": "Time & Solver",
+    },
     "cycles": {
         "label": "Equilibration cycles (Plasma=False)", "unit": "", "default": 1,
         "type": "int", "group": "Time & Solver",
