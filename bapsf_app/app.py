@@ -953,6 +953,57 @@ def _fmt_val(v) -> str:
     return f"{fv:g}"
 
 
+def _decode_param_value(v):
+    """Return a display-friendly scalar from HDF5/string-like values."""
+    if isinstance(v, bytes):
+        return v.decode()
+    return v
+
+
+def _gas_puff_summary(params, flags=None):
+    """Return compact display fields for the active gas-puff schedule."""
+    flags = flags or {}
+    mode = str(_decode_param_value(params.get("gas_puff_mode", "decay_after_breakdown")))
+    twin = bool(flags.get("TwinCathode", False))
+    s_gp = float(params.get("S_gp", 0.0) or 0.0)
+    twin_s_gp = float(params.get("Twin_S_gp", 0.0) or 0.0) if twin else 0.0
+    total = s_gp + twin_s_gp
+
+    if mode == "pulse_decay_to_level":
+        target = float(params.get("S_gp_decay_target", 0.0) or 0.0)
+        twin_target = float(params.get("Twin_S_gp_decay_target", 0.0) or 0.0) if twin else 0.0
+        target_total = target + twin_target
+        hold_ms = float(params.get("tau_gp_pulse_duration", 0.0) or 0.0) * 1e3
+        tau_ms = float(params.get("tau_gp_decay_duration", 0.0) or 0.0) * 1e3
+        return {
+            "mode": mode,
+            "initial_total": total,
+            "target_total": target_total,
+            "hold_ms": hold_ms,
+            "tau_ms": tau_ms,
+            "summary": f"pulse {total:.0f}->{target_total:.0f}, hold={hold_ms:g}ms, tau={tau_ms:g}ms",
+        }
+
+    start = params.get("tau_gp_after_breakdown")
+    factor = float(params.get("tau_gp_decay_factor", 1.0) or 1.0)
+    try:
+        start_ms = float(start) * 1e3
+    except (TypeError, ValueError):
+        start_ms = np.nan
+    if start is None or np.isnan(start_ms):
+        summary = f"decay-after-breakdown S_gp={total:.0f}, steady"
+    else:
+        summary = f"decay S_gp={total:.0f}, start={start_ms:g}ms, factor={factor:g}"
+    return {
+        "mode": mode,
+        "initial_total": total,
+        "target_total": None,
+        "hold_ms": None,
+        "tau_ms": None,
+        "summary": summary,
+    }
+
+
 # ── Sweep thread ──────────────────────────────────────────────────────────────
 
 def _drain_queue():
@@ -1755,14 +1806,24 @@ def _render_explore_tab():
             S_gp = _p("S_gp")
             Twin_S_gp = _p("Twin_S_gp") if twin else 0.0
             gas = _p("gas_type", "?")
-            if isinstance(gas, bytes):
-                gas = gas.decode()
-            S_gp_total = S_gp + Twin_S_gp
+            gas = _decode_param_value(gas)
+            run_params = {
+                "gas_puff_mode": _p("gas_puff_mode", "decay_after_breakdown"),
+                "S_gp": S_gp,
+                "Twin_S_gp": Twin_S_gp,
+                "S_gp_decay_target": _p("S_gp_decay_target"),
+                "Twin_S_gp_decay_target": _p("Twin_S_gp_decay_target") if twin else 0.0,
+                "tau_gp_after_breakdown": _p("tau_gp_after_breakdown", None),
+                "tau_gp_decay_factor": _p("tau_gp_decay_factor", 1.0),
+                "tau_gp_pulse_duration": _p("tau_gp_pulse_duration"),
+                "tau_gp_decay_duration": _p("tau_gp_decay_duration", 1e-3),
+            }
+            gp_summary = _gas_puff_summary(run_params, {"TwinCathode": twin})["summary"]
             twin_str = "twin" if twin else "single"
             t_s_str = f"  T_s={T_s_k - 273.15:.0f}°C" if not np.isnan(T_s_k) else ""
             labels[run_id] = (
                 f"{run_id}  |  {gas}  V_bank={V_bank:.0f}V{t_s_str}  "
-                f"S_gp={S_gp_total:.0f}  [{twin_str}]"
+                f"{gp_summary}  [{twin_str}]"
             )
         return labels
     run_labels = _run_display_labels(idx)
@@ -1786,7 +1847,13 @@ def _render_explore_tab():
             "V_b at peak I_tot [V]", format="%.3e"
         )
         # Default visible columns; all columns still available in CSV export
-        _DEFAULT_PARAMS = ["V_bank", "T_s_C", "gas_type", "nn0", "S_gp", "Twin_S_gp"]
+        _DEFAULT_PARAMS = [
+            "V_bank", "T_s_C", "gas_type", "nn0",
+            "gas_puff_mode", "S_gp", "Twin_S_gp",
+            "S_gp_decay_target", "Twin_S_gp_decay_target",
+            "tau_gp_pulse_duration", "tau_gp_decay_duration",
+            "tau_gp_after_breakdown", "tau_gp_decay_factor",
+        ]
         default_cols = ["run_id", "status", "n_cells"]
         default_cols += [f"p:{k}" for k in _DEFAULT_PARAMS if f"p:{k}" in df.columns]
         default_cols += [c for c in df.columns if c.startswith("f:")]
@@ -1935,6 +2002,23 @@ def _render_explore_tab():
             try:
                 with open_db(db_path) as db:
                     params, flags, results = load_run(db, run_id)
+
+                gp = _gas_puff_summary(params, flags)
+                st.markdown("**Gas puff schedule**")
+                st.dataframe(
+                    [
+                        {
+                            "Mode": gp["mode"],
+                            "Initial total": _fmt_val(gp["initial_total"]),
+                            "Target total": "" if gp["target_total"] is None else _fmt_val(gp["target_total"]),
+                            "Hold [ms]": "" if gp["hold_ms"] is None else _fmt_val(gp["hold_ms"]),
+                            "Decay tau [ms]": "" if gp["tau_ms"] is None else _fmt_val(gp["tau_ms"]),
+                            "Summary": gp["summary"],
+                        }
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
 
                 figs = plot_run(results, params, flags, z_convention=z_conv)
                 fig_name = st.selectbox("Figure", list(figs.keys()), key="inspect_fig")
