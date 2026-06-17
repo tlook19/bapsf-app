@@ -335,8 +335,12 @@ PARAM_META: dict[str, dict] = {
         "type": "float", "group": "Time & Solver",
     },
     "tau_gp_after_breakdown": {
-        "label": "Gas puff shutoff after breakdown (tau_gp_after_breakdown)", "unit": "ms",
+        "label": "Gas puff decay start after breakdown (tau_gp_after_breakdown)", "unit": "ms",
         "default": None, "type": "float_or_none", "group": "Time & Solver",
+    },
+    "tau_gp_decay_factor": {
+        "label": "Gas puff decay time factor (tau_gp_decay_factor)", "unit": "",
+        "default": 1.0, "type": "float", "group": "Time & Solver",
     },
     "tau_afterglow": {
         "label": "Afterglow duration (tau_afterglow)", "unit": "s", "default": 5e-3,
