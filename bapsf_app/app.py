@@ -572,6 +572,7 @@ class SweepState:
     completed: int = 0
     failed: int = 0
     log: list = field(default_factory=list)
+    failed_log: list = field(default_factory=list)
     running: bool = True
     done: bool = False
     error: str = ""
@@ -1038,6 +1039,7 @@ def _drain_queue():
                     "failed": state.failed,
                     "planned_run_ids": state.planned_run_ids,
                     "log": state.log[-50:],
+                    "failed_log": state.failed_log[-50:],
                 })
         elif "error" in msg:
             state.error = msg["error"]
@@ -1055,6 +1057,7 @@ def _drain_queue():
                     "planned_run_ids": state.planned_run_ids,
                     "error": state.error,
                     "log": state.log[-50:],
+                    "failed_log": state.failed_log[-50:],
                 })
         else:
             state.total = msg.get("total", state.total)
@@ -1144,6 +1147,8 @@ def _drain_queue():
                     error_msg = stats.get("_error", "")
                     if error_msg:
                         line += f"  → {error_msg}"
+                if status == "failed":
+                    state.failed_log.append(f"{run_id}  {stats.get('_error', '') or '(no error detail)'}")
                 state.log.append(line)
 
     # Persist progress to manifest every time something changed
@@ -1156,6 +1161,7 @@ def _drain_queue():
             "failed": state.failed,
             "planned_run_ids": state.planned_run_ids,
             "log": state.log[-50:],
+            "failed_log": state.failed_log[-50:],
         })
 
 
@@ -1184,6 +1190,7 @@ def _start_sweep_thread(db_path, n_workers, t_window, param_ranges, flag_ranges,
         "failed": 0,
         "planned_run_ids": planned_ids,
         "log": [],
+        "failed_log": [],
     })
 
     def progress_cb(i, total, run_id, status, stats):
@@ -1349,6 +1356,10 @@ def _render_sweep_progress():
     m2.metric("System available", f"{sys_vm.available / 1e9:.2f} GB")
     m3.metric("System RAM used", f"{sys_vm.percent:.0f}%")
     m4.metric("App + workers CPU", f"{cpu_pct:.0f}%", help=f"{worker_count} worker process(es)")
+
+    if state.failed_log:
+        failed_text = "\n".join(state.failed_log[-20:])
+        st.text_area("Failed runs (last 20)", failed_text, height=120)
 
     log_text = "\n".join(state.log[-30:]) if state.log else "(waiting for first run...)"
     st.text_area("Completed runs (last 30)", log_text, height=200)
@@ -1585,6 +1596,9 @@ def _render_run_tab():
                 last_log = manifest.get("log", [])[-5:]
                 if last_log:
                     st.caption("Last log entries: " + " | ".join(last_log))
+                last_failed = manifest.get("failed_log", [])[-5:]
+                if last_failed:
+                    st.caption("Failed runs: " + " | ".join(last_failed))
 
     if n_workers > 1:
         st.info(
