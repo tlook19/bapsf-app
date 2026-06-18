@@ -974,8 +974,8 @@ _SLICE_META = {
 
 _FACE_FLUX_KEYS = {"Ne_face_flux", "Nn_face_flux", "e_par_face_flux", "i_par_face_flux"}
 
-_ELECTRON_HEAT_TERMS = ["Qie", "Qei", "Qen", "Qeb", "e_par_flux"]
-_ION_HEAT_TERMS = ["Qie", "Qcx", "Qib", "i_par_flux"]
+_ELECTRON_HEAT_TERMS = ["Qie", "Qei", "Qen", "Qeb", "e_par_flux", "div_v_elec", "Te_conv"]
+_ION_HEAT_TERMS = ["Qie", "Qcx", "Qib", "i_par_flux", "div_v_ions", "Ti_conv"]
 _DENSITY_SOURCE_TERMS = ["S_ion_bulk", "S_ion_beam", "S_rec_rad", "S_rec_3b", "Ne_flux"]
 
 
@@ -1032,10 +1032,12 @@ def plot_time_slice(results, params, z_convention, t_ms, quantity):
             else _ION_HEAT_TERMS if quantity == "ion_heat_terms"
             else _DENSITY_SOURCE_TERMS
         )
-        signed_terms = {"e_par_flux", "i_par_flux", "Qie",
+        signed_terms = {"e_par_flux", "i_par_flux", "Qie", "div_v_elec", "div_v_ions", "Te_conv", "Ti_conv",
                         "S_ion_bulk", "S_ion_beam", "S_rec_rad", "S_rec_3b", "Ne_flux"}
         prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
         for i, term in enumerate(terms):
+            if term not in results:
+                continue
             color = prop_cycle[i % len(prop_cycle)]
             data2d = np.asarray(results[term])
             y = data2d[idx, :]

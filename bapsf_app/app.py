@@ -422,6 +422,8 @@ PARAM_META: dict[str, dict] = {
     "b_Qie": {"label": "Q_ie scale (b_Qie)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_Qei": {"label": "Q_ei scale (b_Qei)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_Qen": {"label": "Q_en scale (b_Qen)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
+    "b_div_v_elec": {"label": "Electron compression scale (b_div_v_elec)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
+    "b_div_v_ions": {"label": "Ion compression scale (b_div_v_ions)", "unit": "", "default": 0.0, "type": "float", "group": "Transport Scaling"},
 }
 
 # Twin cathode params rendered separately under Dual Cathode section.
