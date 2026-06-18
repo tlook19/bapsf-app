@@ -459,7 +459,7 @@ FLAG_META: dict[str, dict] = {
     "icool_recomb": {"label": "Ion cooling from recombination", "default": False, "group": "Physics"},
     "Plasma": {"label": "Plasma physics", "default": True, "group": "Simulation"},
     "Velocity": {"label": "Plasma velocity", "default": True, "group": "Simulation"},
-    "advection": {"label": "Convective v·∇v acceleration", "default": True, "group": "Simulation"},
+    "advection": {"label": "Convective v·∇v acceleration", "default": False, "group": "Simulation"},
     "hybrid_ne": {"label": "Hybrid density flux (sonic correction)", "default": True, "group": "Simulation"},
     "adaptive_mesh": {"label": "Adaptive spatial mesh", "default": False, "group": "Simulation"},
 }
