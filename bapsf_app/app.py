@@ -407,6 +407,10 @@ PARAM_META: dict[str, dict] = {
         "label": "Min step, pre-breakdown (h_min_prebreakdown)", "unit": "s", "default": 1e-6,
         "type": "float", "group": "Time & Solver",
     },
+    "prebreakdown_cfl_factor": {
+        "label": "Pre-breakdown CFL factor (prebreakdown_cfl_factor)", "unit": "",
+        "default": 10.0, "type": "float", "group": "Time & Solver",
+    },
     # ── Transport Scaling ─────────────────────────────────────────────────────
     "b_epara": {"label": "e⁻ parallel scale (b_epara)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_ipara": {"label": "Ion parallel scale (b_ipara)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
