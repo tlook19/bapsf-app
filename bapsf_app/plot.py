@@ -1142,6 +1142,8 @@ def plot_time_slice(results, params, z_convention, t_ms, quantity):
         z, y = z[valid], y[valid]
 
         ax.plot(z, y, marker="o", markersize=4, linewidth=1.5)
+        if quantity == "ne":
+            ax.set_ylim(bottom=0)
 
         if use_log and np.any(y[y > 0]):
             ax.set_yscale("log")
