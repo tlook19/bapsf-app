@@ -345,19 +345,19 @@ PARAM_META: dict[str, dict] = {
     },
     "tau_gp_after_breakdown": {
         "label": "Gas puff decay start after breakdown (tau_gp_after_breakdown)", "unit": "ms",
-        "default": None, "type": "float_or_none", "group": "Time & Solver",
+        "default": None, "type": "float_or_none", "group": "Discharge (Primary Cathode)",
     },
     "tau_gp_decay_factor": {
         "label": "Gas puff decay time factor (tau_gp_decay_factor)", "unit": "",
-        "default": 1.0, "type": "float", "group": "Time & Solver",
+        "default": 1.0, "type": "float", "group": "Discharge (Primary Cathode)",
     },
     "tau_gp_pulse_duration": {
         "label": "Gas puff pulse duration (tau_gp_pulse_duration)", "unit": "s",
-        "default": 0.0, "type": "float", "group": "Time & Solver",
+        "default": 0.0, "type": "float", "group": "Discharge (Primary Cathode)",
     },
     "tau_gp_decay_duration": {
         "label": "Gas puff decay duration (tau_gp_decay_duration)", "unit": "s",
-        "default": 1e-3, "type": "float", "group": "Time & Solver",
+        "default": 1e-3, "type": "float", "group": "Discharge (Primary Cathode)",
     },
     "tau_afterglow": {
         "label": "Afterglow duration (tau_afterglow)", "unit": "s", "default": 5e-3,
@@ -431,6 +431,17 @@ TWIN_META: dict[str, dict] = {
         "default": 0.0,
         "type": "float",
     },
+}
+
+_GAS_PUFF_DECAY_AFTER_BREAKDOWN_PARAMS = {
+    "tau_gp_after_breakdown",
+    "tau_gp_decay_factor",
+}
+_GAS_PUFF_PULSE_DECAY_PARAMS = {
+    "S_gp_decay_target",
+    "tau_gp_pulse_duration",
+    "tau_gp_decay_duration",
+    "Twin_S_gp_decay_target",
 }
 
 FLAG_META: dict[str, dict] = {
@@ -687,6 +698,25 @@ def _num_format(value) -> str:
     if v >= 1e5 or v < 1e-3:
         return "%.3e"
     return "%g"
+
+
+def _selected_gas_puff_modes() -> set[str]:
+    """Return gas puff modes currently fixed or included in the sweep."""
+    meta = PARAM_META["gas_puff_mode"]
+    choices = set(meta.get("choices", []))
+    if st.session_state.get("pmode_gas_puff_mode", "Fixed") == "Vary":
+        selected = st.session_state.get("pvary_gas_puff_mode", list(choices))
+        return set(selected) or choices
+    return {st.session_state.get("pfixed_gas_puff_mode", meta["default"])}
+
+
+def _is_gas_puff_param_visible(key: str) -> bool:
+    modes = _selected_gas_puff_modes()
+    if key in _GAS_PUFF_DECAY_AFTER_BREAKDOWN_PARAMS:
+        return "decay_after_breakdown" in modes
+    if key in _GAS_PUFF_PULSE_DECAY_PARAMS:
+        return "pulse_decay_to_level" in modes
+    return True
 
 
 def _render_param_row(key: str, meta: dict) -> None:
@@ -1407,6 +1437,8 @@ def _render_configure_tab():
                 for key, meta in PARAM_META.items():
                     if meta["group"] != group:
                         continue
+                    if not _is_gas_puff_param_visible(key):
+                        continue
                     if key in _ADAPTIVE_MESH_PARAMS and st.session_state.get("flagcfg_adaptive_mesh", "False") == "False":
                         continue
                     _render_param_row(key, meta)
@@ -1463,6 +1495,8 @@ def _render_configure_tab():
                 else:
                     st.markdown("**Second cathode parameters:**")
                     for key, meta in TWIN_META.items():
+                        if not _is_gas_puff_param_visible(key):
+                            continue
                         _render_param_row(key, meta)
 
     with col_flags:
@@ -1492,6 +1526,8 @@ def _render_configure_tab():
             for group in PARAM_GROUP_ORDER:
                 for k, v in fixed_params.items():
                     if k in PARAM_META and PARAM_META[k]["group"] == group:
+                        if not _is_gas_puff_param_visible(k):
+                            continue
                         meta = PARAM_META[k]
                         rows.append({
                             "Group": group,
@@ -1501,6 +1537,8 @@ def _render_configure_tab():
                         })
             for k, v in fixed_params.items():
                 if k in TWIN_META:
+                    if not _is_gas_puff_param_visible(k):
+                        continue
                     meta = TWIN_META[k]
                     rows.append({
                         "Group": "Dual Cathode",
