@@ -51,6 +51,7 @@ from bapsf_app.sweep import (
 )
 from bapsf_app.database import open_db, load_index, list_runs, load_run, rebuild_index, update_index
 from bapsf_app.plot import (
+    plot_cathode_iv_time,
     plot_run,
     plot_run_comparison,
     plot_sweep_variance,
@@ -2083,6 +2084,14 @@ def _render_explore_tab():
                     width="stretch",
                     hide_index=True,
                 )
+
+                st.markdown("**Cathode I_tot and V_b**")
+                fig_cathode = plot_cathode_iv_time(results)
+                if fig_cathode is None:
+                    st.info("Cathode I_tot/V_b time series are not available for this run.")
+                else:
+                    st.pyplot(fig_cathode, width="stretch")
+                    plt.close(fig_cathode)
 
                 figs = plot_run(results, params, flags, z_convention=z_conv)
                 fig_name = st.selectbox("Figure", list(figs.keys()), key="inspect_fig")

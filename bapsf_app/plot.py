@@ -56,6 +56,63 @@ def _linear_tick_label(v, pos=None):
     return f"{v:g}"
 
 
+def _cathode_field(cathode, field):
+    if cathode is None:
+        return None
+    if isinstance(cathode, dict):
+        return cathode.get(field)
+    return getattr(cathode, field, None)
+
+
+def _finite_series(values):
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim != 1 or not np.any(np.isfinite(arr)):
+        return None
+    return arr
+
+
+def plot_cathode_iv_time(results):
+    """Plot cathode total current and beam voltage versus time."""
+    time = _finite_series(results.get("time"))
+    cathode = results.get("cathode")
+    i_tot = _finite_series(_cathode_field(cathode, "I_tot"))
+    v_b = _finite_series(_cathode_field(cathode, "V_b"))
+    if time is None or i_tot is None or v_b is None:
+        return None
+
+    fig, ax_i = plt.subplots(figsize=(7.5, 3.8))
+    ax_v = ax_i.twinx()
+
+    n = min(len(time), len(i_tot), len(v_b))
+    t = time[:n]
+    ax_i.plot(t, i_tot[:n], color="tab:blue", lw=1.7, label="I_tot")
+    ax_v.plot(t, v_b[:n], color="tab:orange", lw=1.7, label="V_b")
+
+    twin = results.get("cathode_twin")
+    i_tot_twin = _finite_series(_cathode_field(twin, "I_tot"))
+    v_b_twin = _finite_series(_cathode_field(twin, "V_b"))
+    if i_tot_twin is not None and v_b_twin is not None:
+        nt = min(len(time), len(i_tot_twin), len(v_b_twin))
+        ax_i.plot(time[:nt], i_tot_twin[:nt], color="tab:blue", lw=1.2, ls="--", label="Twin I_tot")
+        ax_v.plot(time[:nt], v_b_twin[:nt], color="tab:orange", lw=1.2, ls="--", label="Twin V_b")
+
+    ax_i.set_xlabel("Time [ms]")
+    ax_i.set_ylabel("I_tot [A]", color="tab:blue")
+    ax_v.set_ylabel("V_b [V]", color="tab:orange")
+    ax_i.tick_params(axis="y", labelcolor="tab:blue")
+    ax_v.tick_params(axis="y", labelcolor="tab:orange")
+    ax_i.grid(True, alpha=0.25)
+    ax_i.set_title("Cathode current and beam voltage")
+
+    lines_i, labels_i = ax_i.get_legend_handles_labels()
+    lines_v, labels_v = ax_v.get_legend_handles_labels()
+    ax_i.legend(lines_i + lines_v, labels_i + labels_v, loc="best", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
 def _nice_log_levels(vmin_log, vmax_log, mantissas=(1, 2, 5)):
     emin = int(np.floor(vmin_log))
     emax = int(np.ceil(vmax_log))
