@@ -56,6 +56,63 @@ def _linear_tick_label(v, pos=None):
     return f"{v:g}"
 
 
+def _cathode_field(cathode, field):
+    if cathode is None:
+        return None
+    if isinstance(cathode, dict):
+        return cathode.get(field)
+    return getattr(cathode, field, None)
+
+
+def _finite_series(values):
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim != 1 or not np.any(np.isfinite(arr)):
+        return None
+    return arr
+
+
+def plot_cathode_iv_time(results):
+    """Plot cathode total current and beam voltage versus time."""
+    time = _finite_series(results.get("time"))
+    cathode = results.get("cathode")
+    i_tot = _finite_series(_cathode_field(cathode, "I_tot"))
+    v_b = _finite_series(_cathode_field(cathode, "V_b"))
+    if time is None or i_tot is None or v_b is None:
+        return None
+
+    fig, ax_i = plt.subplots(figsize=(7.5, 3.8))
+    ax_v = ax_i.twinx()
+
+    n = min(len(time), len(i_tot), len(v_b))
+    t = time[:n]
+    ax_i.plot(t, i_tot[:n], color="tab:blue", lw=1.7, label="I_tot")
+    ax_v.plot(t, v_b[:n], color="tab:orange", lw=1.7, label="V_b")
+
+    twin = results.get("cathode_twin")
+    i_tot_twin = _finite_series(_cathode_field(twin, "I_tot"))
+    v_b_twin = _finite_series(_cathode_field(twin, "V_b"))
+    if i_tot_twin is not None and v_b_twin is not None:
+        nt = min(len(time), len(i_tot_twin), len(v_b_twin))
+        ax_i.plot(time[:nt], i_tot_twin[:nt], color="tab:blue", lw=1.2, ls="--", label="Twin I_tot")
+        ax_v.plot(time[:nt], v_b_twin[:nt], color="tab:orange", lw=1.2, ls="--", label="Twin V_b")
+
+    ax_i.set_xlabel("Time [ms]")
+    ax_i.set_ylabel("I_tot [A]", color="tab:blue")
+    ax_v.set_ylabel("V_b [V]", color="tab:orange")
+    ax_i.tick_params(axis="y", labelcolor="tab:blue")
+    ax_v.tick_params(axis="y", labelcolor="tab:orange")
+    ax_i.grid(True, alpha=0.25)
+    ax_i.set_title("Cathode current and beam voltage")
+
+    lines_i, labels_i = ax_i.get_legend_handles_labels()
+    lines_v, labels_v = ax_v.get_legend_handles_labels()
+    ax_i.legend(lines_i + lines_v, labels_i + labels_v, loc="best", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
 def _nice_log_levels(vmin_log, vmax_log, mantissas=(1, 2, 5)):
     emin = int(np.floor(vmin_log))
     emax = int(np.ceil(vmax_log))
@@ -541,6 +598,7 @@ def _plot_2d(results, params, flags, z_pos, z_convention, save_dir):
 def _plot_contour(results, params, flags, z_pos, z_convention, save_dir):
     """Position-vs-time contour plots for >5 cells."""
     t = results["time"]
+    L_plasma = params.get("Lp", params.get("L_plasma", 1800))
     title_base = _run_title(params, flags)
     z_label = _z_axis_label(z_convention)
     figs = {}
@@ -973,8 +1031,8 @@ _SLICE_META = {
 
 _FACE_FLUX_KEYS = {"Ne_face_flux", "Nn_face_flux", "e_par_face_flux", "i_par_face_flux"}
 
-_ELECTRON_HEAT_TERMS = ["Qie", "Qei", "Qen", "Qeb", "e_par_flux"]
-_ION_HEAT_TERMS = ["Qie", "Qcx", "Qib", "i_par_flux"]
+_ELECTRON_HEAT_TERMS = ["Qie", "Qei", "Qen", "Qeb", "e_par_flux", "div_v_elec", "Te_conv"]
+_ION_HEAT_TERMS = ["Qie", "Qcx", "Qib", "i_par_flux", "div_v_ions", "Ti_conv"]
 _DENSITY_SOURCE_TERMS = ["S_ion_bulk", "S_ion_beam", "S_rec_rad", "S_rec_3b", "Ne_flux"]
 
 
@@ -1022,7 +1080,7 @@ def plot_time_slice(results, params, z_convention, t_ms, quantity):
     idx = int(np.argmin(np.abs(time - t_ms)))
     t_actual = float(time[idx])
 
-    Lp = float(params["Lp"])
+    Lp = float(params.get("Lp", params.get("L_plasma", 1800)))
     fig, ax = plt.subplots(figsize=(7, 4))
 
     if quantity in ("electron_heat_terms", "ion_heat_terms", "density_source_terms"):
@@ -1031,10 +1089,12 @@ def plot_time_slice(results, params, z_convention, t_ms, quantity):
             else _ION_HEAT_TERMS if quantity == "ion_heat_terms"
             else _DENSITY_SOURCE_TERMS
         )
-        signed_terms = {"e_par_flux", "i_par_flux", "Qie",
+        signed_terms = {"e_par_flux", "i_par_flux", "Qie", "div_v_elec", "div_v_ions", "Te_conv", "Ti_conv",
                         "S_ion_bulk", "S_ion_beam", "S_rec_rad", "S_rec_3b", "Ne_flux"}
         prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
         for i, term in enumerate(terms):
+            if term not in results:
+                continue
             color = prop_cycle[i % len(prop_cycle)]
             data2d = np.asarray(results[term])
             y = data2d[idx, :]
@@ -1082,6 +1142,8 @@ def plot_time_slice(results, params, z_convention, t_ms, quantity):
         z, y = z[valid], y[valid]
 
         ax.plot(z, y, marker="o", markersize=4, linewidth=1.5)
+        if quantity == "ne":
+            ax.set_ylim(bottom=0)
 
         if use_log and np.any(y[y > 0]):
             ax.set_yscale("log")

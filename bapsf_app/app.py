@@ -31,15 +31,27 @@ import numpy as np
 import psutil
 import streamlit as st
 
+try:
+    import setproctitle
+
+    setproctitle.setproctitle("bapsf-app")
+except ImportError:
+    pass
+
 matplotlib.use("Agg")  # non-interactive backend required for Streamlit
 
 _WORKSPACE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _DEFAULT_DB_PATH = _WORKSPACE_ROOT / "database" / "sweep.h5"
 
 # Absolute imports (relative imports fail when Streamlit runs app.py as __main__)
-from bapsf_app.sweep import grid_sweep_parallel, param_combinations
+from bapsf_app.sweep import (
+    get_worker_affinity_info,
+    grid_sweep_parallel,
+    param_combinations,
+)
 from bapsf_app.database import open_db, load_index, list_runs, load_run, rebuild_index, update_index
 from bapsf_app.plot import (
+    plot_cathode_iv_time,
     plot_run,
     plot_run_comparison,
     plot_sweep_variance,
@@ -252,8 +264,17 @@ PARAM_META: dict[str, dict] = {
         "label": "Power supply voltage (V_bank)", "unit": "V", "default": 100.0,
         "type": "float", "group": "Discharge (Primary Cathode)",
     },
+    "gas_puff_mode": {
+        "label": "Gas puff mode (gas_puff_mode)", "unit": "",
+        "default": "decay_after_breakdown", "type": "str", "group": "Discharge (Primary Cathode)",
+        "choices": ["decay_after_breakdown", "pulse_decay_to_level"],
+    },
     "S_gp": {
         "label": "Gas puff source rate (S_gp)", "unit": "", "default": 500.0,
+        "type": "float", "group": "Discharge (Primary Cathode)",
+    },
+    "S_gp_decay_target": {
+        "label": "Gas puff target rate (S_gp_decay_target)", "unit": "", "default": 0.0,
         "type": "float", "group": "Discharge (Primary Cathode)",
     },
     "T_s": {
@@ -324,8 +345,20 @@ PARAM_META: dict[str, dict] = {
         "type": "float", "group": "Time & Solver",
     },
     "tau_gp_after_breakdown": {
-        "label": "Gas puff shutoff after breakdown (tau_gp_after_breakdown)", "unit": "ms",
-        "default": None, "type": "float_or_none", "group": "Time & Solver",
+        "label": "Gas puff decay start after breakdown (tau_gp_after_breakdown)", "unit": "ms",
+        "default": None, "type": "float_or_none", "group": "Discharge (Primary Cathode)",
+    },
+    "tau_gp_decay_factor": {
+        "label": "Gas puff decay time factor (tau_gp_decay_factor)", "unit": "",
+        "default": 1.0, "type": "float", "group": "Discharge (Primary Cathode)",
+    },
+    "tau_gp_pulse_duration": {
+        "label": "Gas puff pulse duration (tau_gp_pulse_duration)", "unit": "s",
+        "default": 0.0, "type": "float", "group": "Discharge (Primary Cathode)",
+    },
+    "tau_gp_decay_duration": {
+        "label": "Gas puff decay duration (tau_gp_decay_duration)", "unit": "s",
+        "default": 1e-3, "type": "float", "group": "Discharge (Primary Cathode)",
     },
     "tau_afterglow": {
         "label": "Afterglow duration (tau_afterglow)", "unit": "s", "default": 5e-3,
@@ -355,6 +388,10 @@ PARAM_META: dict[str, dict] = {
         "label": "Max step, afterglow (h_max_afterglow)", "unit": "s", "default": 1e-4,
         "type": "float", "group": "Time & Solver",
     },
+    "max_step_rejections": {
+        "label": "Max consecutive step rejections (max_step_rejections)", "unit": "",
+        "default": 200, "type": "int", "group": "Time & Solver",
+    },
     "cycles": {
         "label": "Equilibration cycles (Plasma=False)", "unit": "", "default": 1,
         "type": "int", "group": "Time & Solver",
@@ -371,6 +408,10 @@ PARAM_META: dict[str, dict] = {
         "label": "Min step, pre-breakdown (h_min_prebreakdown)", "unit": "s", "default": 1e-6,
         "type": "float", "group": "Time & Solver",
     },
+    "prebreakdown_cfl_factor": {
+        "label": "Pre-breakdown CFL factor (prebreakdown_cfl_factor)", "unit": "",
+        "default": 10.0, "type": "float", "group": "Time & Solver",
+    },
     # ── Transport Scaling ─────────────────────────────────────────────────────
     "b_epara": {"label": "e⁻ parallel scale (b_epara)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_ipara": {"label": "Ion parallel scale (b_ipara)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
@@ -382,6 +423,10 @@ PARAM_META: dict[str, dict] = {
     "b_Qie": {"label": "Q_ie scale (b_Qie)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_Qei": {"label": "Q_ei scale (b_Qei)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
     "b_Qen": {"label": "Q_en scale (b_Qen)", "unit": "", "default": 1.0, "type": "float", "group": "Transport Scaling"},
+    "b_div_v_elec": {"label": "Electron compression scale (b_div_v_elec)", "unit": "", "default": 0.0, "type": "float", "group": "Transport Scaling"},
+    "b_div_v_ions": {"label": "Ion compression scale (b_div_v_ions)", "unit": "", "default": 0.0, "type": "float", "group": "Transport Scaling"},
+    "b_Te_conv": {"label": "Electron convection scale (b_Te_conv)", "unit": "", "default": 0.0, "type": "float", "group": "Transport Scaling"},
+    "b_Ti_conv": {"label": "Ion convection scale (b_Ti_conv)", "unit": "", "default": 0.0, "type": "float", "group": "Transport Scaling"},
 }
 
 # Twin cathode params rendered separately under Dual Cathode section.
@@ -389,6 +434,23 @@ PARAM_META: dict[str, dict] = {
 # the neutral-side initial conditions differ per cathode.
 TWIN_META: dict[str, dict] = {
     "Twin_S_gp": {"label": "Twin gas puff rate (Twin_S_gp)", "unit": "", "default": 500.0, "type": "float"},
+    "Twin_S_gp_decay_target": {
+        "label": "Twin gas puff target rate (Twin_S_gp_decay_target)",
+        "unit": "",
+        "default": 0.0,
+        "type": "float",
+    },
+}
+
+_GAS_PUFF_DECAY_AFTER_BREAKDOWN_PARAMS = {
+    "tau_gp_after_breakdown",
+    "tau_gp_decay_factor",
+}
+_GAS_PUFF_PULSE_DECAY_PARAMS = {
+    "S_gp_decay_target",
+    "tau_gp_pulse_duration",
+    "tau_gp_decay_duration",
+    "Twin_S_gp_decay_target",
 }
 
 FLAG_META: dict[str, dict] = {
@@ -398,7 +460,7 @@ FLAG_META: dict[str, dict] = {
     "icool_recomb": {"label": "Ion cooling from recombination", "default": False, "group": "Physics"},
     "Plasma": {"label": "Plasma physics", "default": True, "group": "Simulation"},
     "Velocity": {"label": "Plasma velocity", "default": True, "group": "Simulation"},
-    "advection": {"label": "Convective v·∇v acceleration", "default": True, "group": "Simulation"},
+    "advection": {"label": "Convective v·∇v acceleration", "default": False, "group": "Simulation"},
     "hybrid_ne": {"label": "Hybrid density flux (sonic correction)", "default": True, "group": "Simulation"},
     "adaptive_mesh": {"label": "Adaptive spatial mesh", "default": False, "group": "Simulation"},
 }
@@ -530,6 +592,7 @@ class SweepState:
     completed: int = 0
     failed: int = 0
     log: list = field(default_factory=list)
+    failed_log: list = field(default_factory=list)
     running: bool = True
     done: bool = False
     error: str = ""
@@ -644,6 +707,25 @@ def _num_format(value) -> str:
     if v >= 1e5 or v < 1e-3:
         return "%.3e"
     return "%g"
+
+
+def _selected_gas_puff_modes() -> set[str]:
+    """Return gas puff modes currently fixed or included in the sweep."""
+    meta = PARAM_META["gas_puff_mode"]
+    choices = set(meta.get("choices", []))
+    if st.session_state.get("pmode_gas_puff_mode", "Fixed") == "Vary":
+        selected = st.session_state.get("pvary_gas_puff_mode", list(choices))
+        return set(selected) or choices
+    return {st.session_state.get("pfixed_gas_puff_mode", meta["default"])}
+
+
+def _is_gas_puff_param_visible(key: str) -> bool:
+    modes = _selected_gas_puff_modes()
+    if key in _GAS_PUFF_DECAY_AFTER_BREAKDOWN_PARAMS:
+        return "decay_after_breakdown" in modes
+    if key in _GAS_PUFF_PULSE_DECAY_PARAMS:
+        return "pulse_decay_to_level" in modes
+    return True
 
 
 def _render_param_row(key: str, meta: dict) -> None:
@@ -865,6 +947,14 @@ def _build_sweep_config():
         if twin_active and _sym:
             params["S_gp"] = params.get("S_gp", PARAM_META["S_gp"]["default"]) / 2.0
             params["Twin_S_gp"] = params["S_gp"]
+            params["S_gp_decay_target"] = (
+                params.get(
+                    "S_gp_decay_target",
+                    PARAM_META["S_gp_decay_target"]["default"],
+                )
+                / 2.0
+            )
+            params["Twin_S_gp_decay_target"] = params["S_gp_decay_target"]
         return params
 
     return param_ranges, flag_ranges, fixed_params, fixed_flags, _param_transform
@@ -907,6 +997,57 @@ def _fmt_val(v) -> str:
     return f"{fv:g}"
 
 
+def _decode_param_value(v):
+    """Return a display-friendly scalar from HDF5/string-like values."""
+    if isinstance(v, bytes):
+        return v.decode()
+    return v
+
+
+def _gas_puff_summary(params, flags=None):
+    """Return compact display fields for the active gas-puff schedule."""
+    flags = flags or {}
+    mode = str(_decode_param_value(params.get("gas_puff_mode", "decay_after_breakdown")))
+    twin = bool(flags.get("TwinCathode", False))
+    s_gp = float(params.get("S_gp", 0.0) or 0.0)
+    twin_s_gp = float(params.get("Twin_S_gp", 0.0) or 0.0) if twin else 0.0
+    total = s_gp + twin_s_gp
+
+    if mode == "pulse_decay_to_level":
+        target = float(params.get("S_gp_decay_target", 0.0) or 0.0)
+        twin_target = float(params.get("Twin_S_gp_decay_target", 0.0) or 0.0) if twin else 0.0
+        target_total = target + twin_target
+        hold_ms = float(params.get("tau_gp_pulse_duration", 0.0) or 0.0) * 1e3
+        tau_ms = float(params.get("tau_gp_decay_duration", 0.0) or 0.0) * 1e3
+        return {
+            "mode": mode,
+            "initial_total": total,
+            "target_total": target_total,
+            "hold_ms": hold_ms,
+            "tau_ms": tau_ms,
+            "summary": f"pulse {total:.0f}->{target_total:.0f}, hold={hold_ms:g}ms, tau={tau_ms:g}ms",
+        }
+
+    start = params.get("tau_gp_after_breakdown")
+    factor = float(params.get("tau_gp_decay_factor", 1.0) or 1.0)
+    try:
+        start_ms = float(start) * 1e3
+    except (TypeError, ValueError):
+        start_ms = np.nan
+    if start is None or np.isnan(start_ms):
+        summary = f"decay-after-breakdown S_gp={total:.0f}, steady"
+    else:
+        summary = f"decay S_gp={total:.0f}, start={start_ms:g}ms, factor={factor:g}"
+    return {
+        "mode": mode,
+        "initial_total": total,
+        "target_total": None,
+        "hold_ms": None,
+        "tau_ms": None,
+        "summary": summary,
+    }
+
+
 # ── Sweep thread ──────────────────────────────────────────────────────────────
 
 def _drain_queue():
@@ -937,6 +1078,7 @@ def _drain_queue():
                     "failed": state.failed,
                     "planned_run_ids": state.planned_run_ids,
                     "log": state.log[-50:],
+                    "failed_log": state.failed_log[-50:],
                 })
         elif "error" in msg:
             state.error = msg["error"]
@@ -954,6 +1096,7 @@ def _drain_queue():
                     "planned_run_ids": state.planned_run_ids,
                     "error": state.error,
                     "log": state.log[-50:],
+                    "failed_log": state.failed_log[-50:],
                 })
         else:
             state.total = msg.get("total", state.total)
@@ -1043,6 +1186,8 @@ def _drain_queue():
                     error_msg = stats.get("_error", "")
                     if error_msg:
                         line += f"  → {error_msg}"
+                if status == "failed":
+                    state.failed_log.append(f"{run_id}  {stats.get('_error', '') or '(no error detail)'}")
                 state.log.append(line)
 
     # Persist progress to manifest every time something changed
@@ -1055,6 +1200,7 @@ def _drain_queue():
             "failed": state.failed,
             "planned_run_ids": state.planned_run_ids,
             "log": state.log[-50:],
+            "failed_log": state.failed_log[-50:],
         })
 
 
@@ -1083,6 +1229,7 @@ def _start_sweep_thread(db_path, n_workers, t_window, param_ranges, flag_ranges,
         "failed": 0,
         "planned_run_ids": planned_ids,
         "log": [],
+        "failed_log": [],
     })
 
     def progress_cb(i, total, run_id, status, stats):
@@ -1249,6 +1396,10 @@ def _render_sweep_progress():
     m3.metric("System RAM used", f"{sys_vm.percent:.0f}%")
     m4.metric("App + workers CPU", f"{cpu_pct:.0f}%", help=f"{worker_count} worker process(es)")
 
+    if state.failed_log:
+        failed_text = "\n".join(state.failed_log[-20:])
+        st.text_area("Failed runs (last 20)", failed_text, height=120)
+
     log_text = "\n".join(state.log[-30:]) if state.log else "(waiting for first run...)"
     st.text_area("Completed runs (last 30)", log_text, height=200)
 
@@ -1294,6 +1445,8 @@ def _render_configure_tab():
             with st.expander(group, expanded=expanded):
                 for key, meta in PARAM_META.items():
                     if meta["group"] != group:
+                        continue
+                    if not _is_gas_puff_param_visible(key):
                         continue
                     if key in _ADAPTIVE_MESH_PARAMS and st.session_state.get("flagcfg_adaptive_mesh", "False") == "False":
                         continue
@@ -1351,6 +1504,8 @@ def _render_configure_tab():
                 else:
                     st.markdown("**Second cathode parameters:**")
                     for key, meta in TWIN_META.items():
+                        if not _is_gas_puff_param_visible(key):
+                            continue
                         _render_param_row(key, meta)
 
     with col_flags:
@@ -1380,6 +1535,8 @@ def _render_configure_tab():
             for group in PARAM_GROUP_ORDER:
                 for k, v in fixed_params.items():
                     if k in PARAM_META and PARAM_META[k]["group"] == group:
+                        if not _is_gas_puff_param_visible(k):
+                            continue
                         meta = PARAM_META[k]
                         rows.append({
                             "Group": group,
@@ -1389,6 +1546,8 @@ def _render_configure_tab():
                         })
             for k, v in fixed_params.items():
                 if k in TWIN_META:
+                    if not _is_gas_puff_param_visible(k):
+                        continue
                     meta = TWIN_META[k]
                     rows.append({
                         "Group": "Dual Cathode",
@@ -1415,8 +1574,16 @@ def _render_run_tab():
     db_path = _render_path_input("run_db", "Database path", str(_DEFAULT_DB_PATH))
     db_path_exp = os.path.expanduser(db_path)
 
+    worker_cpu_info = get_worker_affinity_info()
+    worker_cpu_count = max(int(worker_cpu_info.get("count") or 1), 1)
+    logical_cpu_count = max(int(worker_cpu_info.get("logical_count") or worker_cpu_count), 1)
+    max_workers = worker_cpu_count if worker_cpu_info.get("limited") else logical_cpu_count
+    max_workers = max(max_workers, 1)
+    current_workers = int(st.session_state.get("run_n_workers", 1))
+    if current_workers > max_workers:
+        st.session_state["run_n_workers"] = max_workers
+
     col1, col2, _col3 = st.columns(3)
-    max_workers = psutil.cpu_count(logical=True) or 4
     n_workers = col1.number_input("Workers", min_value=1, max_value=max_workers,
                                   value=1, key="run_n_workers")
     with col2:
@@ -1424,6 +1591,26 @@ def _render_run_tab():
                                   key="run_t_start")
         t_end = st.number_input("t_window end (ms, 0=breakdown)", min_value=0.0, value=20.0,
                                 key="run_t_end")
+
+    if worker_cpu_info.get("limited"):
+        cpu_ids = worker_cpu_info.get("cpus") or []
+        if worker_cpu_info.get("source") == "BAPSF_WORKER_CPUS":
+            label = "Worker CPU override"
+        else:
+            label = "Detected P-core worker pool"
+        st.caption(
+            f"{label}: {worker_cpu_count} logical CPU(s) "
+            f"out of {logical_cpu_count}. Worker launch is capped to this count. "
+            f"CPU IDs: {cpu_ids}"
+        )
+    else:
+        note = (
+            "P-core detection unavailable; workers are not affinity-limited "
+            f"(logical CPUs: {logical_cpu_count})."
+        )
+        if worker_cpu_info.get("error"):
+            note += f" Detection note: {worker_cpu_info['error']}."
+        st.caption(note)
 
     # ── Reconnect / interrupt banner ──────────────────────────────────────────
     already_running = st.session_state.get("sweep_running", False)
@@ -1456,11 +1643,15 @@ def _render_run_tab():
                 last_log = manifest.get("log", [])[-5:]
                 if last_log:
                     st.caption("Last log entries: " + " | ".join(last_log))
+                last_failed = manifest.get("failed_log", [])[-5:]
+                if last_failed:
+                    st.caption("Failed runs: " + " | ".join(last_failed))
 
     if n_workers > 1:
         st.info(
             f"Parallel mode: {n_workers} workers.  "
-            "Simulations run in separate processes; HDF5 writes are serialised on the main thread."
+            "Simulations run in separate processes; HDF5 writes are serialised on the main thread. "
+            "On Windows hybrid CPUs, workers are pinned to the detected P-core CPU set."
         )
 
     equilibrate_nn = st.checkbox(
@@ -1680,14 +1871,24 @@ def _render_explore_tab():
             S_gp = _p("S_gp")
             Twin_S_gp = _p("Twin_S_gp") if twin else 0.0
             gas = _p("gas_type", "?")
-            if isinstance(gas, bytes):
-                gas = gas.decode()
-            S_gp_total = S_gp + Twin_S_gp
+            gas = _decode_param_value(gas)
+            run_params = {
+                "gas_puff_mode": _p("gas_puff_mode", "decay_after_breakdown"),
+                "S_gp": S_gp,
+                "Twin_S_gp": Twin_S_gp,
+                "S_gp_decay_target": _p("S_gp_decay_target"),
+                "Twin_S_gp_decay_target": _p("Twin_S_gp_decay_target") if twin else 0.0,
+                "tau_gp_after_breakdown": _p("tau_gp_after_breakdown", None),
+                "tau_gp_decay_factor": _p("tau_gp_decay_factor", 1.0),
+                "tau_gp_pulse_duration": _p("tau_gp_pulse_duration"),
+                "tau_gp_decay_duration": _p("tau_gp_decay_duration", 1e-3),
+            }
+            gp_summary = _gas_puff_summary(run_params, {"TwinCathode": twin})["summary"]
             twin_str = "twin" if twin else "single"
             t_s_str = f"  T_s={T_s_k - 273.15:.0f}°C" if not np.isnan(T_s_k) else ""
             labels[run_id] = (
                 f"{run_id}  |  {gas}  V_bank={V_bank:.0f}V{t_s_str}  "
-                f"S_gp={S_gp_total:.0f}  [{twin_str}]"
+                f"{gp_summary}  [{twin_str}]"
             )
         return labels
     run_labels = _run_display_labels(idx)
@@ -1711,7 +1912,13 @@ def _render_explore_tab():
             "V_b at peak I_tot [V]", format="%.3e"
         )
         # Default visible columns; all columns still available in CSV export
-        _DEFAULT_PARAMS = ["V_bank", "T_s_C", "gas_type", "nn0", "S_gp", "Twin_S_gp"]
+        _DEFAULT_PARAMS = [
+            "V_bank", "T_s_C", "gas_type", "nn0",
+            "gas_puff_mode", "S_gp", "Twin_S_gp",
+            "S_gp_decay_target", "Twin_S_gp_decay_target",
+            "tau_gp_pulse_duration", "tau_gp_decay_duration",
+            "tau_gp_after_breakdown", "tau_gp_decay_factor",
+        ]
         default_cols = ["run_id", "status", "n_cells"]
         default_cols += [f"p:{k}" for k in _DEFAULT_PARAMS if f"p:{k}" in df.columns]
         default_cols += [c for c in df.columns if c.startswith("f:")]
@@ -1860,6 +2067,31 @@ def _render_explore_tab():
             try:
                 with open_db(db_path) as db:
                     params, flags, results = load_run(db, run_id)
+
+                gp = _gas_puff_summary(params, flags)
+                st.markdown("**Gas puff schedule**")
+                st.dataframe(
+                    [
+                        {
+                            "Mode": gp["mode"],
+                            "Initial total": _fmt_val(gp["initial_total"]),
+                            "Target total": "" if gp["target_total"] is None else _fmt_val(gp["target_total"]),
+                            "Hold [ms]": "" if gp["hold_ms"] is None else _fmt_val(gp["hold_ms"]),
+                            "Decay tau [ms]": "" if gp["tau_ms"] is None else _fmt_val(gp["tau_ms"]),
+                            "Summary": gp["summary"],
+                        }
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+
+                st.markdown("**Cathode I_tot and V_b**")
+                fig_cathode = plot_cathode_iv_time(results)
+                if fig_cathode is None:
+                    st.info("Cathode I_tot/V_b time series are not available for this run.")
+                else:
+                    st.pyplot(fig_cathode, width="stretch")
+                    plt.close(fig_cathode)
 
                 figs = plot_run(results, params, flags, z_convention=z_conv)
                 fig_name = st.selectbox("Figure", list(figs.keys()), key="inspect_fig")

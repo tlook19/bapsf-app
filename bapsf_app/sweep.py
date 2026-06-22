@@ -21,11 +21,13 @@ import multiprocessing
 import os
 import pathlib
 import queue as _stdlib_queue
+import sys
 import tempfile
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from concurrent.futures.process import BrokenProcessPool
+from functools import lru_cache
 
 import numpy as np
 
@@ -466,6 +468,7 @@ def grid_sweep(
 
 _WORKER_PROGRESS_Q = None   # set in each worker by _worker_init; never pickled as a task arg
 _WORKER_LOG_FILE = None     # holds open file ref so GC doesn't close it prematurely
+_WORKER_CPU_ENV = "BAPSF_WORKER_CPUS"
 
 
 def _diagnostic_log_dir(db_path):
@@ -481,6 +484,209 @@ def _new_log_prefix(db_path):
     db_p = pathlib.Path(db_path).expanduser()
     stamp = time.strftime("%Y%m%d_%H%M%S")
     return f"{db_p.stem}.{stamp}_{time.time_ns() % 1_000_000_000:09d}"
+
+
+def _logical_cpu_count():
+    """Return the number of logical CPUs visible to this Python process."""
+    return os.cpu_count() or 1
+
+
+def _parse_cpu_list(text):
+    """
+    Parse CPU IDs from strings like ``"0-7,12,14-15"``.
+
+    Used for the ``BAPSF_WORKER_CPUS`` override when Windows CPU-set detection
+    does not match the local machine's P-core layout.
+    """
+    cpus = set()
+    for part in str(text).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            start = int(start_s.strip())
+            end = int(end_s.strip())
+            if start > end:
+                raise ValueError(f"invalid CPU range {part!r}")
+            cpus.update(range(start, end + 1))
+        else:
+            cpus.add(int(part))
+
+    max_cpu = _logical_cpu_count() - 1
+    invalid = [cpu for cpu in cpus if cpu < 0 or cpu > max_cpu]
+    if invalid:
+        raise ValueError(
+            f"CPU IDs outside 0-{max_cpu}: "
+            + ", ".join(str(cpu) for cpu in sorted(invalid))
+        )
+    if not cpus:
+        raise ValueError("no CPU IDs provided")
+    return sorted(cpus)
+
+
+def _detect_windows_p_core_cpus():
+    """
+    Return logical CPU IDs for Windows performance cores, if distinguishable.
+
+    Windows exposes hybrid-core hints through GetSystemCpuSetInformation().
+    On Intel hybrid systems, higher EfficiencyClass values correspond to
+    performance cores.  If all CPUs report the same class, the machine is either
+    non-hybrid or Windows did not expose a useful split, so we return None.
+    """
+    if sys.platform != "win32":
+        return None, "Windows CPU-set API is unavailable on this platform"
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_cpu_sets = kernel32.GetSystemCpuSetInformation
+        get_cpu_sets.argtypes = [
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            ctypes.POINTER(wintypes.ULONG),
+            wintypes.HANDLE,
+            wintypes.ULONG,
+        ]
+        get_cpu_sets.restype = wintypes.BOOL
+
+        needed = wintypes.ULONG(0)
+        get_cpu_sets(None, 0, ctypes.byref(needed), None, 0)
+        if needed.value <= 0:
+            return None, "Windows did not report CPU-set information"
+
+        buf = ctypes.create_string_buffer(needed.value)
+        buf_ptr = ctypes.cast(buf, ctypes.c_void_p)
+        if not get_cpu_sets(buf_ptr, needed.value, ctypes.byref(needed), None, 0):
+            err = ctypes.get_last_error()
+            return None, f"GetSystemCpuSetInformation failed with error {err}"
+
+        cpus_by_efficiency = {}
+        offset = 0
+        raw = buf.raw
+        while offset + 20 <= needed.value:
+            size = int.from_bytes(raw[offset:offset + 4], "little")
+            info_type = int.from_bytes(raw[offset + 4:offset + 8], "little")
+            if size <= 0 or offset + size > needed.value:
+                break
+            if info_type == 0 and size >= 20:  # CpuSetInformation
+                group = int.from_bytes(raw[offset + 12:offset + 14], "little")
+                logical_cpu = raw[offset + 14]
+                efficiency = raw[offset + 18]
+                if group == 0:
+                    cpus_by_efficiency.setdefault(efficiency, []).append(logical_cpu)
+            offset += size
+
+        if not cpus_by_efficiency:
+            return None, "Windows CPU-set information contained no group-0 CPUs"
+        if len(cpus_by_efficiency) == 1:
+            return None, "all logical CPUs report the same efficiency class"
+
+        p_class = max(cpus_by_efficiency)
+        return sorted(set(cpus_by_efficiency[p_class])), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+@lru_cache(maxsize=1)
+def get_worker_affinity_info():
+    """
+    Return worker CPU-affinity information for UI display and worker setup.
+
+    ``BAPSF_WORKER_CPUS`` overrides automatic detection.  On Windows hybrid
+    CPUs, automatic detection pins workers to logical CPUs in the highest
+    EfficiencyClass.  On other platforms, or when detection is ambiguous, worker
+    affinity is left unchanged.
+    """
+    logical = _logical_cpu_count()
+    override = os.environ.get(_WORKER_CPU_ENV, "").strip()
+    if override:
+        try:
+            cpus = _parse_cpu_list(override)
+            return {
+                "cpus": cpus,
+                "count": len(cpus),
+                "logical_count": logical,
+                "source": _WORKER_CPU_ENV,
+                "limited": True,
+                "error": None,
+            }
+        except Exception as exc:
+            return {
+                "cpus": None,
+                "count": logical,
+                "logical_count": logical,
+                "source": _WORKER_CPU_ENV,
+                "limited": False,
+                "error": str(exc),
+            }
+
+    cpus, error = _detect_windows_p_core_cpus()
+    if cpus:
+        return {
+            "cpus": cpus,
+            "count": len(cpus),
+            "logical_count": logical,
+            "source": "windows_efficiency_class",
+            "limited": True,
+            "error": None,
+        }
+
+    return {
+        "cpus": None,
+        "count": logical,
+        "logical_count": logical,
+        "source": "all_logical_cpus",
+        "limited": False,
+        "error": error,
+    }
+
+
+def _apply_worker_cpu_affinity():
+    """Pin this worker to preferred CPUs when a P-core set was detected."""
+    info = get_worker_affinity_info()
+    before = None
+    after = None
+    error = info.get("error")
+    cpus = info.get("cpus")
+    if not cpus:
+        return info, before, after, error
+
+    try:
+        import psutil
+
+        proc = psutil.Process()
+        before = proc.cpu_affinity()
+        proc.cpu_affinity(cpus)
+        after = proc.cpu_affinity()
+    except Exception as exc:
+        error = str(exc)
+    return info, before, after, error
+
+
+def _set_process_title(title):
+    """Set the visible process title when setproctitle is installed."""
+    try:
+        import setproctitle
+
+        setproctitle.setproctitle(title)
+        return True
+    except Exception:
+        return False
+
+
+def _next_worker_number(worker_counter):
+    """Return a 1-based worker number for process-title/log labels."""
+    if worker_counter is None:
+        return None
+    try:
+        with worker_counter.get_lock():
+            worker_counter.value += 1
+            return int(worker_counter.value)
+    except Exception:
+        return None
 
 
 def _set_worker_thread_limits():
@@ -508,7 +714,7 @@ def _set_worker_thread_limits():
         os.environ["XDG_CACHE_HOME"] = xdg_cache_dir
 
 
-def _worker_init(progress_q, db_path=None, log_dir=None, log_prefix=None):
+def _worker_init(progress_q, db_path=None, log_dir=None, log_prefix=None, worker_counter=None):
     """
     Called once per worker process at spawn time.
     Stores the progress queue in a module-level global (avoids pickling it per task),
@@ -522,7 +728,15 @@ def _worker_init(progress_q, db_path=None, log_dir=None, log_prefix=None):
     _WORKER_PROGRESS_Q = progress_q
     _set_worker_thread_limits()
 
-    import sys as _sys, time as _time
+    import time as _time
+
+    _worker_number = _next_worker_number(worker_counter)
+    _worker_title = (
+        f"bapsf-worker-{_worker_number}"
+        if _worker_number is not None
+        else f"bapsf-worker-{os.getpid()}"
+    )
+    _process_title_set = _set_process_title(_worker_title)
 
     # Workers inherit the parent process's nice value.  When the app is launched
     # from a low-priority shell (e.g. `conda run ... &` from a VSCode terminal)
@@ -542,7 +756,7 @@ def _worker_init(progress_q, db_path=None, log_dir=None, log_prefix=None):
     # Promote to highest-priority CPU cores available on the current platform.
     # Spawned worker processes often inherit a low scheduling class that puts them
     # on efficiency cores or at reduced frequency.
-    if _sys.platform == "darwin":
+    if sys.platform == "darwin":
         # Apple Silicon: USER_INTERACTIVE (0x21) targets maximum P-core frequency.
         try:
             import ctypes as _ctypes
@@ -553,7 +767,7 @@ def _worker_init(progress_q, db_path=None, log_dir=None, log_prefix=None):
             _qos_promoted = (_actual_qos == _QOS_CLASS_USER_INTERACTIVE)
         except Exception:
             _qos_promoted = False
-    elif _sys.platform == "win32":
+    elif sys.platform == "win32":
         # Windows (Intel/AMD hybrid P/E cores): THREAD_PRIORITY_HIGHEST steers the
         # scheduler toward P-cores on Thread Director-aware systems (12th gen Intel+).
         try:
@@ -567,6 +781,8 @@ def _worker_init(progress_q, db_path=None, log_dir=None, log_prefix=None):
             _qos_promoted = False
     else:
         _qos_promoted = None  # Linux / other: rely on nice reset above
+
+    _affinity_info, _affinity_before, _affinity_after, _affinity_error = _apply_worker_cpu_affinity()
 
     if db_path is not None:
         db_p = pathlib.Path(db_path).expanduser()
@@ -588,25 +804,32 @@ def _worker_init(progress_q, db_path=None, log_dir=None, log_prefix=None):
         log_path = fallback_dir / f"{prefix}.worker_{os.getpid()}.log"
         log_file = open(log_path, "w", buffering=1, encoding="utf-8")
     log_file.write(
-        f"# bapsf worker pid={os.getpid()} started {_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"# {_worker_title} pid={os.getpid()} started {_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"# db={db_path}\n"
         f"# log={log_path}\n"
-        f"# nice: {_nice_before} -> {_nice_after}  qos_promoted={_qos_promoted}\n\n"
+        f"# process_title_set={_process_title_set}\n"
+        f"# nice: {_nice_before} -> {_nice_after}  qos_promoted={_qos_promoted}\n"
+        f"# worker_cpu_source={_affinity_info.get('source')}  "
+        f"worker_cpu_count={_affinity_info.get('count')}  "
+        f"logical_cpu_count={_affinity_info.get('logical_count')}\n"
+        f"# worker_cpu_ids={_affinity_info.get('cpus')}  "
+        f"affinity={_affinity_before} -> {_affinity_after}  "
+        f"affinity_error={_affinity_error}\n\n"
     )
     log_file.flush()
 
     # Redirect OS-level fd 1/2 so that C-level printf in native extensions also goes
     # to the log file rather than the parent's pipe (which would block once full on
     # POSIX).  Wrapped in try/except because Windows dup2 semantics differ slightly.
-    if _sys.platform != "win32":
+    if sys.platform != "win32":
         try:
             log_fd = log_file.fileno()
             os.dup2(log_fd, 1)
             os.dup2(log_fd, 2)
         except Exception:
             pass
-    _sys.stdout = log_file
-    _sys.stderr = log_file
+    sys.stdout = log_file
+    sys.stderr = log_file
     _WORKER_LOG_FILE = log_file  # keep alive; sys.stdout ref alone is enough but belt-and-suspenders
 
 
@@ -962,6 +1185,7 @@ def grid_sweep_parallel(
     # Queue is passed to workers via initargs (pickled once during spawn, not per task).
     # Task args contain only plain Python objects to avoid _CallItem serialization errors.
     progress_mp_q = multiprocessing.Queue()
+    worker_counter = multiprocessing.Value("i", 0)
     parallel_start_count = completed_count
 
     import logging
@@ -984,7 +1208,7 @@ def grid_sweep_parallel(
     with ProcessPoolExecutor(
         max_workers=n_workers,
         initializer=_worker_init,
-        initargs=(progress_mp_q, db_path, str(_log_dir), _log_prefix),
+        initargs=(progress_mp_q, db_path, str(_log_dir), _log_prefix, worker_counter),
     ) as executor:
         future_to_run = {}
         for (run_id, params, flags), equil_info in zip(pending, pending_equil_info):
